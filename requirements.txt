@@ -1,0 +1,11 @@
+# CodeChat Pro — Python Dependencies
+
+PyQt6
+fastapi
+uvicorn
+numpy
+requests
+pydantic
+SpeechRecognition
+PyAudio
+pyngrok
