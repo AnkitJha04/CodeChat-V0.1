@@ -1374,20 +1374,6 @@ Vivekanand Education Society's Institute of Technology (VESIT)
 
 ---
 
-# 📄 License
-
-License information is currently **TBD**.
-
-If this project is published publicly, add an appropriate license such as:
-
-```text
-MIT
-Apache-2.0
-GPL-3.0
-```
-
----
-
 # ⭐ CodeChat Pro
 
 > **Build locally. Collaborate securely. Keep your knowledge yours.**
