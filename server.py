@@ -45,9 +45,13 @@ CHAT_DELETED_FOR = {}
 # Per-user/per-conversation timestamp after which messages remain visible.
 # This gives each member a private "delete/clear chat for me" boundary.
 CHAT_CLEARED_AT = {}
-# {member_id: {conversation_id: last_message_id_at_clear}}
+# Per-user read cursor for WhatsApp-style unread counts/notifications.
+CHAT_READ_UP_TO = {}
+# {member_id: {conversation_id: last_message_id_seen}}
 TEAM_GROUPS = {}
 CHAT_AI_SESSIONS = {}
+# Per-process AI memory only. It is deliberately never persisted.
+AI_SESSION_EPOCH = uuid.uuid4().hex
 
 HOST_TOKEN = os.environ.get("CODECHAT_HOST_TOKEN", "")
 HOST_NAME = os.environ.get("CODECHAT_HOST_NAME", "Host").strip() or "Host"
@@ -144,6 +148,7 @@ def _safe_json_state():
         "team_chat_messages": TEAM_CHAT_MESSAGES,
         "chat_deleted_for": {k: sorted(v) for k, v in CHAT_DELETED_FOR.items() if v},
         "chat_cleared_at": CHAT_CLEARED_AT,
+        "chat_read_up_to": CHAT_READ_UP_TO,
         "team_mode": TEAM_MODE,
         "brain_version": BRAIN_VERSION,
         "team_brain_ready": TEAM_BRAIN_READY,
@@ -167,7 +172,7 @@ def persist_server_state():
 
 def load_server_state():
     global ACCESS_TOKENS, PENDING_INVITES, TEAM_HISTORY, TEAM_EVENTS
-    global TEAM_GROUPS, TEAM_CHAT_MESSAGES, CHAT_DELETED_FOR, CHAT_CLEARED_AT, TEAM_MODE, BRAIN_VERSION
+    global TEAM_GROUPS, TEAM_CHAT_MESSAGES, CHAT_DELETED_FOR, CHAT_CLEARED_AT, CHAT_READ_UP_TO, TEAM_MODE, BRAIN_VERSION
     global TEAM_BRAIN_READY, TEAM_CHAT_ENABLED, CURRENT_SESSION_ID, CURRENT_SESSION_STARTED, SESSION_RECORDS
     try:
         if not os.path.exists(SERVER_STATE_FILE):
@@ -182,6 +187,7 @@ def load_server_state():
         TEAM_CHAT_MESSAGES = d.get("team_chat_messages", []) or []
         CHAT_DELETED_FOR = {str(k): set(v or []) for k, v in (d.get("chat_deleted_for", {}) or {}).items()}
         CHAT_CLEARED_AT = {str(k): dict(v or {}) for k, v in (d.get("chat_cleared_at", {}) or {}).items()}
+        CHAT_READ_UP_TO = {str(k): dict(v or {}) for k, v in (d.get("chat_read_up_to", {}) or {}).items()}
         TEAM_MODE = d.get("team_mode", "single")
         BRAIN_VERSION = int(d.get("brain_version", 0) or 0)
         TEAM_BRAIN_READY = bool(d.get("team_brain_ready", False))
@@ -511,7 +517,7 @@ def get_chat_message_view(message):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "29.0", "service": "codechat-team-server"}
+    return {"status": "ok", "version": "34.0", "service": "codechat-team-server", "ai_session_epoch": AI_SESSION_EPOCH}
 
 
 # ============================================================
@@ -684,8 +690,8 @@ def get_team_state(user_data: dict = Depends(get_user)):
         "handle": info.get("handle", "host"),
         "member_id": user_data["member_id"],
         "members": public_member_list(),
-        "files": sorted(set(os.path.basename(str(x)) for x in brain.sources)),
-        "file_count": len(set(brain.sources)),
+        "files": [os.path.basename(str(x)) for x in getattr(brain, "source_order", []) if x in set(brain.sources)],
+        "file_count": len(getattr(brain, "source_order", []) or set(brain.sources)),
         "admin": HOST_NAME,
         "session_id": CURRENT_SESSION_ID,
         "events": TEAM_EVENTS[-100:],
@@ -721,6 +727,8 @@ def set_mode(mode_data: dict, user_data: dict = Depends(require_host)):
                 BRAIN_VERSION += 1
 
         TEAM_MODE = mode
+        USER_SESSIONS.clear()
+        CHAT_AI_SESSIONS.clear()
 
     record_event(
         "mode_changed",
@@ -765,6 +773,8 @@ def sync_brain(payload: SyncPayload, user_data: dict = Depends(require_host)):
 
         BRAIN_VERSION += 1
         TEAM_BRAIN_READY = True
+        USER_SESSIONS.clear()
+        CHAT_AI_SESSIONS.clear()
 
         record_event(
             "brain_synced",
@@ -834,7 +844,12 @@ def _set_brain_workspace_context():
             for m in public_member_list()
         ],
         "file_count": len(set(brain.sources)),
-        "files": sorted(set(os.path.basename(str(x)) for x in brain.sources)),
+        "files": [str(x) for x in getattr(brain, "source_order", []) if x in set(brain.sources)],
+        "file_details": [
+            {"source": str(src), "filename": os.path.basename(str(src)),
+             "chunks": sum(1 for x in brain.sources if x == src)}
+            for src in getattr(brain, "source_order", []) if src in set(brain.sources)
+        ],
         "brain_version": BRAIN_VERSION,
     }
 
@@ -906,7 +921,14 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
     )
 
     try:
-        tuples = [(c.text, c.source) for c in req.chunks]
+        # The client-provided source path is metadata only. The server creates a
+        # stable per-member logical identity, so `main.py` from two contributors
+        # can never silently overwrite or masquerade as the same file.
+        tuples = []
+        for c in req.chunks:
+            raw_name = os.path.basename(str(c.source).replace("\\", "/")) or "unnamed_file"
+            logical_source = f"{user_data['member_id']}/{raw_name}"
+            tuples.append((c.text, logical_source))
 
         with BRAIN_LOCK:
             old_chunks = list(brain.chunks)
@@ -918,6 +940,30 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
                 lambda x: print(f"-> {x}"),
                 append_mode=append_mode
             )
+
+            # Hard invariant: Single Mode contains exactly the latest uploaded
+            # file. This is enforced server-side even if a client sends a stale
+            # append_mode flag or an older client implementation.
+            if TEAM_MODE == "single" and brain.sources:
+                latest_source = brain.source_order[-1] if getattr(brain, "source_order", []) else brain.sources[-1]
+                keep = [i for i, src in enumerate(brain.sources) if src == latest_source]
+                if keep and len(keep) != len(brain.sources):
+                    brain.chunks = [brain.chunks[i] for i in keep]
+                    brain.sources = [brain.sources[i] for i in keep]
+                    brain.embeddings = np.asarray(brain.embeddings, dtype=np.float32)[keep]
+                    brain.source_order = [latest_source]
+                    brain.local_history = []
+
+            # Keep the authoritative manifest clean and ordered.
+            seen_manifest = []
+            for src in getattr(brain, "source_order", []) or brain.sources:
+                if src in brain.sources and src not in seen_manifest:
+                    seen_manifest.append(src)
+            for src in brain.sources:
+                if src not in seen_manifest:
+                    seen_manifest.append(src)
+            brain.source_order = seen_manifest
+
             save_result = brain.save_snapshot(SERVER_BRAIN_FILE)
             if "Success" not in save_result:
                 brain.chunks = old_chunks
@@ -932,6 +978,8 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
 
         BRAIN_VERSION += 1
         TEAM_BRAIN_READY = True
+        USER_SESSIONS.clear()
+        CHAT_AI_SESSIONS.clear()
 
         record_event(
             "brain_updated",
@@ -1301,6 +1349,8 @@ def delete_chat_conversation(
     CHAT_CLEARED_AT.setdefault(member_id, {})[conversation_id] = last_message_id
     # Keep the older hide structure harmless for backward-compatible state files.
     CHAT_DELETED_FOR.setdefault(member_id, set()).discard(conversation_id)
+    if last_message_id:
+        CHAT_READ_UP_TO.setdefault(member_id, {})[conversation_id] = last_message_id
     persist_server_state()
     record_event(
         "chat_deleted_for_me",
@@ -1309,6 +1359,71 @@ def delete_chat_conversation(
         {"conversation_id": conversation_id, "cleared_at": cleared_at, "last_message_id": last_message_id}
     )
     return {"status": "deleted_for_me", "conversation_id": conversation_id, "cleared_at": cleared_at}
+
+
+@app.get("/chat/notifications")
+def get_chat_notifications(user_data: dict = Depends(get_user)):
+    """Return WhatsApp-style unread counts and recent notifications for one user.
+    A message is unread until the user opens that conversation (or explicitly
+    marks it read). Mentions are detected anywhere in the message body.
+    """
+    member_id = user_data["member_id"]
+    deleted = CHAT_DELETED_FOR.get(member_id, set())
+    cleared = CHAT_CLEARED_AT.get(member_id, {})
+    read = CHAT_READ_UP_TO.setdefault(member_id, {})
+    unread = {}
+    notifications = []
+
+    for m in TEAM_CHAT_MESSAGES:
+        cid = m.get("conversation_id")
+        sender = m.get("sender_id")
+        if not cid or sender in (member_id, "codechat-ai"):
+            continue
+        if cid in deleted or not can_access_conversation(member_id, cid):
+            continue
+        clear_id = cleared.get(cid)
+        if clear_id:
+            ids = [x.get("id") for x in TEAM_CHAT_MESSAGES if x.get("conversation_id") == cid]
+            if clear_id in ids and m.get("id") in ids and ids.index(m.get("id")) <= ids.index(clear_id):
+                continue
+        last_read = read.get(cid, "")
+        if last_read:
+            ids = [x.get("id") for x in TEAM_CHAT_MESSAGES if x.get("conversation_id") == cid]
+            if m.get("id") in ids and last_read in ids and ids.index(m.get("id")) <= ids.index(last_read):
+                continue
+        unread[cid] = unread.get(cid, 0) + 1
+        mentioned = member_id != "host" and bool(re.search(r"@(?:" + re.escape(user_data["info"].get("handle", "")) + r"|" + re.escape(member_id) + r")\b", str(m.get("message", "")), re.IGNORECASE))
+        if member_id == "host":
+            mentioned = bool(re.search(r"@(?:host|" + re.escape(HOST_NAME.replace(" ", "_")) + r")\b", str(m.get("message", "")), re.IGNORECASE))
+        if mentioned or len(notifications) < 30:
+            notifications.append({
+                "id": m.get("id"), "conversation_id": cid,
+                "sender": m.get("sender", "Unknown"), "handle": m.get("handle", ""),
+                "message": m.get("message", ""), "timestamp": m.get("timestamp", ""),
+                "mentioned": mentioned
+            })
+
+    # Only active conversations need unread badges; cap payload size.
+    return {"unread": unread, "notifications": notifications[-30:]}
+
+
+class ChatReadRequest(BaseModel):
+    conversation_id: str
+    message_id: Optional[str] = None
+
+
+@app.post("/chat/read")
+def mark_chat_read(req: ChatReadRequest, user_data: dict = Depends(get_user)):
+    member_id = user_data["member_id"]
+    cid = req.conversation_id
+    if not can_access_conversation(member_id, cid):
+        raise HTTPException(status_code=403, detail="You are not a participant in this conversation.")
+    ids = [m.get("id") for m in TEAM_CHAT_MESSAGES if m.get("conversation_id") == cid]
+    message_id = req.message_id or (ids[-1] if ids else "")
+    if message_id:
+        CHAT_READ_UP_TO.setdefault(member_id, {})[cid] = message_id
+        persist_server_state()
+    return {"status": "read", "conversation_id": cid, "message_id": message_id}
 
 
 @app.post("/chat/messages")
@@ -1585,19 +1700,22 @@ def initialize_server():
         if SERVER_INITIALIZED:
             return
         load_server_state()
-        # The GUI launches this module as `main.py --server`, so the old
-        # __main__-only Brain restore path was skipped. Restore the authoritative
-        # Team Brain before exposing the API.
-        global TEAM_BRAIN_READY, BRAIN_VERSION
-        if os.path.exists(SERVER_BRAIN_FILE):
-            try:
-                res = brain.load_snapshot(SERVER_BRAIN_FILE)
-                if "Success" in res and brain.chunks:
-                    TEAM_BRAIN_READY = True
-                    if BRAIN_VERSION <= 0:
-                        BRAIN_VERSION = 1
-            except Exception as e:
-                print(f"Brain restore warning: {e}")
+        # IMPORTANT: every CodeChat launch is a fresh AI session. Persistent
+        # membership/history metadata may be retained for the team UI, but the
+        # Team Brain and all AI conversation memory are intentionally discarded.
+        # A saved .brain/.ccsession becomes active only through an explicit Load.
+        global TEAM_BRAIN_READY, BRAIN_VERSION, CHAT_AI_SESSIONS, USER_SESSIONS
+        brain.chunks = []
+        brain.sources = []
+        brain.embeddings = []
+        brain.source_order = []
+        brain.local_history = []
+        brain.workspace_context = {}
+        TEAM_BRAIN_READY = False
+        BRAIN_VERSION = 0
+        TEAM_MODE = "single"
+        USER_SESSIONS = {}
+        CHAT_AI_SESSIONS = {}
         start_new_live_session()
         SERVER_INITIALIZED = True
 
@@ -1606,15 +1724,8 @@ if __name__ == "__main__":
     initialize_server()
     print("\n" + "=" * 55)
     print("       🚀 CODECHAT TEAM SERVER")
-    print("       VERSION 29.0")
+    print("       VERSION 34.0")
     print("=" * 55 + "\n")
 
-    if os.path.exists(SERVER_BRAIN_FILE):
-        print("📂 Found saved Team Brain, loading...")
-        res = brain.load_snapshot(SERVER_BRAIN_FILE)
-        if "Success" in res:
-            TEAM_BRAIN_READY = True
-            BRAIN_VERSION = 1
-            print(f"✅ Team Brain loaded | {len(brain.chunks)} chunks")
-
+    print("🧹 Fresh AI session: no previous Brain or AI conversation was restored.")
     uvicorn.run(app, host="0.0.0.0", port=8000)

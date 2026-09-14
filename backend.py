@@ -8,6 +8,7 @@ import requests
 import json
 import tempfile
 import threading
+import re
 
 
 def _is_cuda_failure(exc):
@@ -40,14 +41,14 @@ def _friendly_ollama_error(exc, operation="AI"):
 def _ollama_embeddings_with_fallback(model, prompt):
     """Try normal GPU inference first, then retry on CPU for CUDA runner failures."""
     try:
-        return ollama.embeddings(model=model, prompt=prompt)
+        return ollama.Client(host=os.environ.get("CODECHAT_OLLAMA_URL", "http://127.0.0.1:11434")).embeddings(model=model, prompt=prompt)
     except Exception as first_error:
         if not _is_cuda_failure(first_error):
             raise
         # Ollama accepts num_gpu in model options. CPU fallback lets CodeChat
         # recover from a broken/overloaded CUDA runner without killing the app.
         try:
-            return ollama.embeddings(model=model, prompt=prompt, options={"num_gpu": 0})
+            return ollama.Client(host=os.environ.get("CODECHAT_OLLAMA_URL", "http://127.0.0.1:11434")).embeddings(model=model, prompt=prompt, options={"num_gpu": 0})
         except Exception as cpu_error:
             raise RuntimeError(_friendly_ollama_error(cpu_error, "Embedding")) from cpu_error
 
@@ -55,14 +56,14 @@ def _ollama_chat_with_fallback(model, messages, options=None):
     """Try normal GPU inference first, then retry the same request on CPU."""
     base_options = dict(options or {})
     try:
-        return ollama.chat(model=model, messages=messages, options=base_options, stream=False)
+        return ollama.Client(host=os.environ.get("CODECHAT_OLLAMA_URL", "http://127.0.0.1:11434")).chat(model=model, messages=messages, options=base_options, stream=False)
     except Exception as first_error:
         if not _is_cuda_failure(first_error):
             raise
         cpu_options = dict(base_options)
         cpu_options["num_gpu"] = 0
         try:
-            return ollama.chat(model=model, messages=messages, options=cpu_options, stream=False)
+            return ollama.Client(host=os.environ.get("CODECHAT_OLLAMA_URL", "http://127.0.0.1:11434")).chat(model=model, messages=messages, options=cpu_options, stream=False)
         except Exception as cpu_error:
             raise RuntimeError(_friendly_ollama_error(cpu_error, "AI response")) from cpu_error
 
@@ -77,8 +78,12 @@ class CoreBrain:
         self.chunks = []       
         self.embeddings = []   
         self.sources = []      
+        # Ordered unique source manifest. This is the authoritative file order:
+        # the last entry is the most recently uploaded/replaced file.
+        self.source_order = []
         self.local_history = [] 
-        self.model = "llama3.1" 
+        self.model = "llama3.1"
+        self.embedding_model = "nomic-embed-text"
         self.embed_file = "temp_vectors.npy"
         self.meta_file = "temp_metadata.pkl"
         self._lock = threading.RLock()
@@ -95,6 +100,12 @@ class CoreBrain:
             self.team_mode = "single"
         if not hasattr(self, "local_history") or self.local_history is None:
             self.local_history = []
+        if not hasattr(self, "source_order") or not isinstance(getattr(self, "source_order", None), list):
+            seen = []
+            for src in getattr(self, "sources", []) or []:
+                if src not in seen:
+                    seen.append(src)
+            self.source_order = seen
 
     def _read_file(self, file_path):
         try:
@@ -157,7 +168,7 @@ class CoreBrain:
 
         for i, (chunk, path) in enumerate(data_tuples):
             try:
-                resp = _ollama_embeddings_with_fallback(self.model, chunk)
+                resp = _ollama_embeddings_with_fallback(self.embedding_model, chunk)
                 vec = resp.get('embedding')
                 if not vec:
                     raise RuntimeError("Ollama returned an empty embedding")
@@ -175,21 +186,40 @@ class CoreBrain:
 
         new_np = np.asarray(new_vecs, dtype=np.float32)
         with self._lock:
+            incoming_sources = []
+            for src in new_sources:
+                if src not in incoming_sources:
+                    incoming_sources.append(src)
+
             if replace:
+                # SINGLE: the incoming upload is the complete Brain.
                 self.chunks = list(new_chunks)
                 self.sources = list(new_sources)
                 self.embeddings = new_np
+                self.source_order = list(incoming_sources)
                 self.local_history = []
             else:
-                self.chunks.extend(new_chunks)
-                self.sources.extend(new_sources)
-                if len(self.embeddings) == 0:
-                    self.embeddings = new_np
+                # APPEND: treat a source as one logical file. If the same file is
+                # uploaded again, replace its old chunks rather than creating two
+                # competing versions of the same file. New files are appended in
+                # upload order, making source_order[-1] unambiguous.
+                remove_sources = set(incoming_sources)
+                keep = [i for i, src in enumerate(self.sources) if src not in remove_sources]
+                if keep:
+                    kept_chunks = [self.chunks[i] for i in keep]
+                    kept_sources = [self.sources[i] for i in keep]
+                    kept_emb = np.asarray(self.embeddings, dtype=np.float32)[keep]
+                    self.chunks = kept_chunks + list(new_chunks)
+                    self.sources = kept_sources + list(new_sources)
+                    self.embeddings = np.concatenate((kept_emb, new_np), axis=0)
                 else:
-                    self.embeddings = np.concatenate(
-                        (np.asarray(self.embeddings, dtype=np.float32), new_np),
-                        axis=0
-                    )
+                    self.chunks = list(new_chunks)
+                    self.sources = list(new_sources)
+                    self.embeddings = new_np
+
+                existing_order = [src for src in self.source_order if src not in remove_sources]
+                self.source_order = existing_order + incoming_sources
+                self.local_history = []
 
         msg = f"Success: Indexed {len(new_vecs)} chunks from {len(set(new_sources))} file{'s' if len(set(new_sources)) != 1 else ''}."
         if failures:
@@ -197,17 +227,19 @@ class CoreBrain:
         return msg
 
     def retain_latest_file(self):
-        """Single-mode invariant: retain only the most recently ingested source file."""
+        """Single-mode invariant: retain only the most recently uploaded logical file."""
         with self._lock:
+            self._ensure_runtime_state()
             if not self.sources or len(self.sources) != len(self.chunks):
                 return "No Brain data to reduce."
-            latest = self.sources[-1]
+            latest = self.source_order[-1] if self.source_order else self.sources[-1]
             keep = [i for i, src in enumerate(self.sources) if src == latest]
             if not keep:
                 return "No latest file found."
             self.chunks = [self.chunks[i] for i in keep]
             self.sources = [self.sources[i] for i in keep]
             self.embeddings = np.asarray(self.embeddings, dtype=np.float32)[keep]
+            self.source_order = [latest]
             self.local_history = []
             return f"Retained latest file: {os.path.basename(latest)}"
 
@@ -216,16 +248,20 @@ class CoreBrain:
         with self._lock:
             files = []
             seen = set()
-            for src in self.sources:
-                name = os.path.basename(str(src))
-                if name not in seen:
-                    seen.add(name)
-                    files.append(name)
+            for src in getattr(self, "source_order", []) or self.sources:
+                if src in self.sources and src not in seen:
+                    seen.add(src)
+                    files.append(str(src))
             return {
                 "brain_type": "local",
                 "mode": getattr(self, "team_mode", "single"),
                 "file_count": len(files),
                 "files": files[-50:],
+                "file_details": [
+                    {"source": src, "filename": os.path.basename(src),
+                     "chunks": sum(1 for x in self.sources if x == src)}
+                    for src in files
+                ],
                 "chunk_count": len(self.chunks),
                 "team": dict(getattr(self, "workspace_context", {}) or {}),
             }
@@ -302,7 +338,7 @@ class CoreBrain:
                     meta = os.path.join(td, "metadata.pkl")
                     np.save(emb, np.asarray(self.embeddings, dtype=np.float32))
                     with open(meta, 'wb') as f:
-                        pickle.dump({'chunks': list(self.chunks), 'sources': list(self.sources)}, f)
+                        pickle.dump({'chunks': list(self.chunks), 'sources': list(self.sources), 'source_order': list(self.source_order), 'embedding_model': self.embedding_model}, f)
                     with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
                         zf.write(emb, "temp_vectors.npy")
                         zf.write(meta, "temp_metadata.pkl")
@@ -325,10 +361,21 @@ class CoreBrain:
                 with open(os.path.join(td, 'temp_metadata.pkl'), 'rb') as f:
                     d = pickle.load(f)
                 chunks = d.get('chunks', []); sources = d.get('sources', [])
+                snapshot_embedding_model = d.get('embedding_model', 'llama3.1')
+                source_order = d.get('source_order', [])
                 if len(chunks) != len(sources) or len(chunks) != len(emb):
                     return "Invalid Brain file: chunks and embeddings are inconsistent."
                 with self._lock:
                     self.chunks = chunks; self.sources = sources; self.embeddings = np.asarray(emb, dtype=np.float32)
+                    self.embedding_model = snapshot_embedding_model
+                    seen = []
+                    for src in source_order or sources:
+                        if src in sources and src not in seen:
+                            seen.append(src)
+                    for src in sources:
+                        if src not in seen:
+                            seen.append(src)
+                    self.source_order = seen
                 return "Success"
         except Exception as e: return str(e)
 
@@ -367,11 +414,100 @@ class CoreBrain:
         active_history = history if history is not None else self.local_history
 
         try:
-            q_vec = np.array(_ollama_embeddings_with_fallback(self.model, query)['embedding'])
-            sims = np.dot(self.embeddings, q_vec)
-            top_idx = np.argsort(sims)[-5:][::-1]
-            ctx = "\n\n".join([self.chunks[i] for i in top_idx])
-            srcs = [self.sources[i] for i in top_idx]
+            q_vec = np.asarray(_ollama_embeddings_with_fallback(self.embedding_model, query)['embedding'], dtype=np.float32)
+            matrix = np.asarray(self.embeddings, dtype=np.float32)
+            if matrix.ndim != 2 or matrix.shape[0] != len(self.chunks) or matrix.shape[1] != q_vec.shape[0]:
+                return (
+                    "⚠️ This Brain was created with a different embedding model and cannot be queried safely in this session. "
+                    "Re-index the files or load a compatible Brain.", []
+                )
+            # True cosine similarity avoids scale-dependent retrieval errors.
+            q_norm = np.linalg.norm(q_vec)
+            row_norms = np.linalg.norm(matrix, axis=1)
+            if q_norm == 0:
+                return "⚠️ Could not understand the query embedding.", []
+            sims = np.dot(matrix, q_vec) / np.maximum(row_norms * q_norm, 1e-12)
+
+            # Source selection is file-first, not chunk-first. This prevents one
+            # highly similar chunk from one file from causing a second unrelated
+            # file to enter the context.
+            q_lower = query.lower()
+            explicit = []
+            file_selector = re.search(r"@file\s+([^\n]+)", query, flags=re.IGNORECASE)
+            if file_selector:
+                wanted = file_selector.group(1).strip().strip("`\"")
+                for src in dict.fromkeys(self.sources):
+                    if wanted.lower() in {str(src).lower(), os.path.basename(str(src)).lower()}:
+                        explicit.append(src)
+                if not explicit:
+                    return f"⚠️ I could not find the requested file `{wanted}` in the Team Brain.", []
+            for src in dict.fromkeys(self.sources):
+                base = os.path.basename(str(src))
+                stem = os.path.splitext(base)[0]
+                if len(base) >= 5 and base.lower() in q_lower:
+                    explicit.append(src)
+                elif len(stem) >= 4 and re.search(r"(?<![\w])" + re.escape(stem.lower()) + r"(?![\w])", q_lower):
+                    explicit.append(src)
+
+            source_scores = {}
+            for src in dict.fromkeys(self.sources):
+                idxs = [i for i, x in enumerate(self.sources) if x == src]
+                vals = sorted((float(sims[i]) for i in idxs), reverse=True)
+                # Best chunk dominates, but the second-best chunk provides a
+                # small confidence bonus so files with one accidental match lose.
+                source_scores[src] = vals[0] + (0.12 * vals[1] if len(vals) > 1 else 0.0)
+
+            if explicit:
+                # Never silently combine two contributors' files that share the
+                # same filename. If the user says only `main.py` and there are
+                # multiple logical owners, force an unambiguous question instead.
+                by_name = {}
+                for src in explicit:
+                    by_name.setdefault(os.path.basename(str(src)).lower(), []).append(src)
+                ambiguous = [vals for vals in by_name.values() if len(vals) > 1]
+                if ambiguous:
+                    names = ", ".join(ambiguous[0])
+                    return f"⚠️ `{os.path.basename(str(ambiguous[0][0]))}` exists in multiple team files ({names}). Please specify the contributor/path, e.g. `@file {names.split(', ')[0]}`.", []
+                candidate_sources = explicit
+            else:
+                ordered_sources = sorted(source_scores, key=source_scores.get, reverse=True)
+                # Normally answer from the strongest file; only bring in a second
+                # file when its evidence is close enough to the first.
+                candidate_sources = ordered_sources[:2]
+                if candidate_sources and source_scores[candidate_sources[0]] < 0.24:
+                    return "⚠️ I couldn't find sufficiently relevant evidence in the Team Brain for that question. Please name the file if you want a file-specific answer.", []
+                if len(candidate_sources) == 2 and source_scores[candidate_sources[1]] < max(0.24, source_scores[candidate_sources[0]] * 0.72):
+                    candidate_sources = candidate_sources[:1]
+
+            candidate = [i for i, src in enumerate(self.sources) if src in candidate_sources]
+            ranked = sorted(candidate, key=lambda i: float(sims[i]), reverse=True)
+
+            selected = []
+            per_source = {}
+            for i in ranked:
+                src = self.sources[i]
+                limit = 8 if explicit else 5
+                if per_source.get(src, 0) >= limit:
+                    continue
+                # Do not feed very weak chunks to the model.
+                if float(sims[i]) < 0.20 and selected:
+                    continue
+                selected.append(i)
+                per_source[src] = per_source.get(src, 0) + 1
+                if len(selected) >= (10 if explicit else 8):
+                    break
+
+            if not selected:
+                return "⚠️ I couldn't find relevant content in the Team Brain for that question.", []
+
+            # Label every chunk with its real source. The model is explicitly
+            # instructed not to merge facts across files unless the context
+            # supports that relationship.
+            ctx_parts = []
+            for i in selected:
+                ctx_parts.append(f"[SOURCE: {self.sources[i]} | FILE: {os.path.basename(str(self.sources[i]))}]\n{self.chunks[i]}")
+            ctx = "\n\n---\n\n".join(ctx_parts)
+            srcs = list(dict.fromkeys(str(self.sources[i]) for i in selected))
         except Exception as e: return _friendly_ollama_error(e, "Retrieval"), []
 
         info = self.context_summary()
@@ -379,9 +515,11 @@ class CoreBrain:
         system_msg = (
             "You are CodeChat AI, the AI assistant inside CodeChat Pro Team Edition. "
             "You know that you are working inside a code/document workspace. "
-            "Use the provided Context to answer the user's technical question. "
-            "You may answer questions about your workspace only from the workspace metadata below "
-            "and retrieved context; never invent filenames, counts, roles, or team facts. "
+            "Use ONLY the provided retrieved Context and workspace metadata. "
+            "Never invent facts that are not supported by the Context. "
+            "Treat each [SOURCE: filename] section as belonging to that file. Do not merge or attribute code/content from one file to another. "
+            "If the question asks about a specific file and the Context does not contain enough evidence from that file, say that you do not have enough information instead of guessing. "
+            "When useful, explicitly name the source file supporting your answer. "
             f"\n\nWorkspace metadata: {info['file_count']} indexed files, "
             f"{info['chunk_count']} chunks. Files: {file_list}. "
             f"Team context: {info.get('team', {})}. "
@@ -543,6 +681,20 @@ class RemoteBrain:
             return {"messages": []}
         except Exception:
             return {"messages": []}
+
+    def get_chat_notifications(self):
+        try:
+            res = requests.get(f"{self.url}/chat/notifications", headers=self.headers, timeout=3)
+            return res.json() if res.status_code == 200 else {"unread": {}, "notifications": []}
+        except Exception:
+            return {"unread": {}, "notifications": []}
+
+    def mark_chat_read(self, conversation_id, message_id=None):
+        try:
+            res = requests.post(f"{self.url}/chat/read", json={"conversation_id": conversation_id, "message_id": message_id}, headers=self.headers, timeout=3)
+            return res.json() if res.status_code == 200 else {"error": self._error_from_response(res)}
+        except Exception as e:
+            return {"error": str(e)}
 
     def delete_chat_conversation(self, conversation_id):
         try:

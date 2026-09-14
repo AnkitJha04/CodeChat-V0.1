@@ -2,8 +2,8 @@
   "session_id": "history_20260914_150922_569674",
   "started_at": "2026-09-14T15:09:22",
   "created_by": "Host",
-  "updated_at": "2026-09-14T15:18:24",
-  "live": true,
+  "updated_at": "2026-09-14T15:22:55",
+  "live": false,
   "participants": [
     "host",
     "8f12f6d467604bf78b5c4b830d4bc3de"
@@ -217,7 +217,7 @@
       "handle": "ankit_jha",
       "role": "guest",
       "status": "active",
-      "online": true
+      "online": false
     }
   ],
   "mode": "single",

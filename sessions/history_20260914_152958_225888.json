@@ -1,0 +1,129 @@
+{
+  "session_id": "history_20260914_152958_225888",
+  "started_at": "2026-09-14T15:29:58",
+  "created_by": "Host",
+  "updated_at": "2026-09-14T15:36:19",
+  "live": false,
+  "participants": [
+    "host",
+    "83ec5b509dae4fea97e95d7899cfe676"
+  ],
+  "events": [
+    {
+      "type": "session_started",
+      "actor": "Host",
+      "session_id": "history_20260914_152958_225888",
+      "target": null,
+      "details": {
+        "session": "history_20260914_152958_225888",
+        "started_at": "2026-09-14T15:29:58"
+      },
+      "timestamp": "2026-09-14T15:29:58"
+    },
+    {
+      "type": "mode_changed",
+      "actor": "Host",
+      "session_id": "history_20260914_152958_225888",
+      "target": null,
+      "details": {
+        "from": "append",
+        "mode": "single",
+        "latest_file_only": true
+      },
+      "timestamp": "2026-09-14T15:30:05"
+    },
+    {
+      "type": "mode_changed",
+      "actor": "Host",
+      "session_id": "history_20260914_152958_225888",
+      "target": null,
+      "details": {
+        "from": "single",
+        "mode": "append",
+        "latest_file_only": false
+      },
+      "timestamp": "2026-09-14T15:31:55"
+    },
+    {
+      "type": "mode_changed",
+      "actor": "Host",
+      "session_id": "history_20260914_152958_225888",
+      "target": null,
+      "details": {
+        "from": "append",
+        "mode": "single",
+        "latest_file_only": true
+      },
+      "timestamp": "2026-09-14T15:34:09"
+    },
+    {
+      "type": "invited",
+      "actor": "Host",
+      "session_id": "history_20260914_152958_225888",
+      "target": "AJ",
+      "details": {
+        "role": "guest",
+        "invite_token_created": true
+      },
+      "timestamp": "2026-09-14T15:34:26"
+    },
+    {
+      "type": "joined",
+      "actor": "AJ",
+      "session_id": "history_20260914_152958_225888",
+      "target": null,
+      "details": {
+        "member_id": "83ec5b509dae4fea97e95d7899cfe676",
+        "role": "guest",
+        "invited_by": "Host"
+      },
+      "timestamp": "2026-09-14T15:34:49"
+    }
+  ],
+  "public_ai": [],
+  "chat_messages": [],
+  "groups": {
+    "be6eba410b16": {
+      "group_id": "be6eba410b16",
+      "name": "Robptics",
+      "handle": "robptics",
+      "members": [
+        "0d4e0ae9b5304e2aa7eda46a8834e1ba",
+        "84356ec8eff34d498d28ef2448266a41"
+      ],
+      "created_by": "0d4e0ae9b5304e2aa7eda46a8834e1ba",
+      "created_by_name": "Ankit Jha",
+      "created_at": "2026-09-14T14:35:34"
+    }
+  },
+  "members": [
+    {
+      "member_id": "host",
+      "name": "Host",
+      "handle": "host",
+      "role": "host",
+      "status": "active",
+      "online": true
+    },
+    {
+      "member_id": "8f12f6d467604bf78b5c4b830d4bc3de",
+      "name": "Ankit Jha",
+      "email": "Ankit Jha",
+      "handle": "ankit_jha",
+      "role": "guest",
+      "status": "active",
+      "online": false
+    },
+    {
+      "member_id": "83ec5b509dae4fea97e95d7899cfe676",
+      "name": "AJ",
+      "email": "AJ",
+      "handle": "aj",
+      "role": "guest",
+      "status": "active",
+      "online": false
+    }
+  ],
+  "mode": "single",
+  "brain_version": 6
+}

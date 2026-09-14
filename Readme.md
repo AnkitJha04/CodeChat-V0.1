@@ -2,7 +2,7 @@
 
 > **Privacy-first local RAG desktop application for secure AI-assisted team collaboration.**
 
-![Version](https://img.shields.io/badge/version-29.0-blue.svg)
+![Version](https://img.shields.io/badge/version-34.0-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)
 ![GUI](https://img.shields.io/badge/GUI-PyQt6-green.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-red.svg)
@@ -1552,3 +1552,29 @@ Version 22 fixes Team Chat transport and QThread lifecycle issues. Human chat is
 - The same conversation remains available for future messages.
 
 - Group controls: members can leave groups; Host/group creator can delete a group for everyone.
+
+
+## v34 Brain File Invariants
+
+- **Single Mode:** every successful upload replaces the Team Brain; only the newest uploaded file remains.
+- **Append Mode:** successful uploads are appended and all uploaded files remain available to RAG.
+- **Append → Single:** switching modes immediately retains only the newest existing uploaded file.
+- **After Append → Single:** a later upload in Single Mode replaces that retained file, so only the new latest file remains.
+- These rules are enforced by the Team Server, so client-side mode flags cannot accidentally violate them.
+
+## v34 Fresh-Session + Source-Identity Guarantees
+
+- Every CodeChat launch starts a **new isolated Ollama server process** on a fresh local port. CodeChat never reuses an already-running Ollama daemon.
+- The isolated Ollama process uses `OLLAMA_KEEP_ALIVE=0`, one parallel request and one loaded model at a time.
+- Every launch also starts a **fresh CodeChat Team Server process**. An existing CodeChat server on port 8000 is not reused.
+- No previous Ollama conversation, CodeChat AI session history, Team Brain, or AI chat-session state is restored automatically.
+- Saved `.brain` and `.ccsession` files remain available as explicit user-controlled restore points. Loading one is the deliberate operation that restores old evidence/chat.
+- A new Brain upload or mode change clears the previous My AI context so old questions cannot contaminate the new file set.
+- Embeddings use `nomic-embed-text`; the chat model remains `llama3.1`. Brain snapshots store the embedding-model identity so older compatible snapshots can be detected safely.
+- Retrieval is **file-first**: it ranks logical files before selecting chunks, uses cosine similarity, rejects weak evidence, and normally limits general questions to the strongest one or two files.
+- File-specific queries can use `@file filename` and are constrained to that file.
+- Two contributors can upload files with the same filename without collision because the server assigns a stable logical source identity using the member ID plus filename.
+- If a filename is ambiguous across contributors, CodeChat refuses to guess instead of mixing both files.
+- Every retrieved context block is labeled with both its logical source and filename.
+- Single Mode is server-authoritative and contains exactly the latest uploaded logical file. Append Mode retains multiple logical files in upload order. Switching Append → Single keeps only the latest file.
+- Collaborators cannot create the first Team Brain; Host initialization is required.

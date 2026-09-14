@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QTextBrowser, QLineEdit, QPushButton,
     QFileDialog, QLabel, QFrame, QInputDialog, QMessageBox,
     QDialog, QRadioButton, QTextEdit, QTabWidget,
-    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox
+    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox, QSystemTrayIcon, QStyle
 )
 
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QRunnable, QThreadPool, QObject
@@ -33,7 +33,7 @@ from styles import (
     STATUS_GUEST,
     STATUS_COLLAB
 )
-from ollama_setup import setup_ollama
+from ollama_setup import setup_ollama, stop_ollama
 
 
 TEXT_GRAY = "#888888"
@@ -60,45 +60,34 @@ def start_server():
             Path(token_file).write_text(host_token, encoding="utf-8")
         os.environ["CODECHAT_HOST_TOKEN"] = host_token
     except Exception:
-        if not host_token: host_token = secrets.token_hex(32)
+        if not host_token:
+            host_token = secrets.token_hex(32)
 
-    def server_responding():
-        try:
-            r = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
-            return r.status_code == 200 and str(r.json().get("version", "")) == "29.0"
-        except requests.RequestException:
-            return False
-
+    # Never reuse a CodeChat server from an older GUI launch. Reusing it would
+    # also reuse its in-memory AI state. A fresh GUI launch must get a fresh
+    # server process and therefore a fresh USER_SESSIONS/CHAT_AI_SESSIONS epoch.
     try:
-        health = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
+        health = requests.get("http://127.0.0.1:8000/health", timeout=1.0)
         if health.status_code == 200:
-            hv = str(health.json().get("version", ""))
-            if hv == "29.0":
-                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token}, timeout=2)
-                if r.status_code == 200:
-                    print("✅ CodeChat v22 server already running and synchronized.")
-                    return True
-            print(f"⚠️ Old/stale CodeChat server detected (version {hv}); restarting it.")
+            hv = str(health.json().get("version", "unknown"))
+            print(f"⚠️ Existing server detected (version {hv}); terminating it for a fresh session.")
             if sys.platform == "win32":
-                try:
-                    out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
-                    pids = set()
-                    for line in out.splitlines():
-                        if ":8000" in line and "LISTENING" in line:
-                            parts = line.split()
-                            if parts: pids.add(parts[-1])
-                    for pid in pids:
-                        if pid.isdigit():
-                            subprocess.run(["taskkill", "/F", "/PID", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"⚠️ Could not reset stale server: {e}")
+                out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
+                pids = set()
+                for line in out.splitlines():
+                    if ":8000" in line and "LISTENING" in line:
+                        parts = line.split()
+                        if parts and parts[-1].isdigit():
+                            pids.add(parts[-1])
+                for pid in pids:
+                    subprocess.run(["taskkill", "/F", "/PID", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(1)
             else:
-                print("⚠️ Port 8000 is occupied by a non-Windows process; please stop it before restarting CodeChat.")
+                print("⚠️ Port 8000 is occupied; please stop the existing process.")
     except requests.RequestException:
         pass
 
-    print("🚀 Starting CodeChat server...")
+    print("🚀 Starting fresh CodeChat server...")
     if getattr(sys, "frozen", False):
         server_command = [sys.executable, "--server"]
         run_dir = os.path.dirname(sys.executable)
@@ -112,34 +101,31 @@ def start_server():
     try:
         server_process = subprocess.Popen(server_command, creationflags=flags, cwd=run_dir, env=server_env)
     except Exception as e:
-        print(f"❌ Server launch failed: {e}"); server_process = None; return False
-    print("⏳ Waiting for CodeChat server...")
+        print(f"❌ Server launch failed: {e}")
+        server_process = None
+        return False
+
+    print("⏳ Waiting for fresh CodeChat server...")
     for _ in range(40):
         time.sleep(0.5)
         if server_process.poll() is not None:
-            print("❌ Server process stopped unexpectedly."); server_process = None; return False
-        if server_responding():
-            try:
-                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token}, timeout=2)
-                if r.status_code == 200:
-                    print("✅ CodeChat server started successfully."); return True
-            except requests.RequestException: pass
-    print("❌ CodeChat server failed to start."); return False
+            print("❌ Server process stopped unexpectedly.")
+            server_process = None
+            return False
+        try:
+            r = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
+            if r.status_code == 200 and str(r.json().get("version", "")) == "34.0":
+                print(f"✅ Fresh CodeChat server started | AI epoch {r.json().get('ai_session_epoch', '?')}")
+                return True
+        except requests.RequestException:
+            pass
+    print("❌ CodeChat server failed to start.")
+    return False
 
 
 def start_ngrok():
     global ngrok_process, public_url
     print("🌐 Starting ngrok...")
-    # Reuse an already-running local ngrok tunnel when possible.
-    try:
-        r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=1.5)
-        if r.status_code == 200:
-            for tunnel in r.json().get("tunnels", []):
-                if tunnel.get("proto") == "https":
-                    public_url = tunnel.get("public_url")
-                    if public_url:
-                        print(f"✅ Existing ngrok tunnel reused: {public_url}"); return True
-    except requests.RequestException: pass
     try:
         base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
         ngrok_exe = os.path.join(base, "ngrok.exe")
@@ -816,10 +802,15 @@ class CoreApp(QMainWindow):
         self._chat_pool = QThreadPool(self)
         self._chat_pool.setMaxThreadCount(4)
         self._chat_jobs = set()
+        self._task_workers = set()
         self._closing = False
         self._busy = False
+        self._notified_message_ids = set()
+        self._unread_counts = {}
 
         self.init_ui()
+
+        self._setup_notifications()
 
         self.team_timer = QTimer()
 
@@ -1326,6 +1317,82 @@ class CoreApp(QMainWindow):
         self.refresh_chat_conversations()
 
     # --------------------------------------------------------
+    # NOTIFICATIONS
+    # --------------------------------------------------------
+
+    def _setup_notifications(self):
+        self._tray = None
+        try:
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray = QSystemTrayIcon(self)
+                self._tray.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+                self._tray.setToolTip("CodeChat Pro")
+                self._tray.show()
+        except Exception:
+            self._tray = None
+
+    def _notification_data(self):
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                return self.brain.get_chat_notifications()
+            r = requests.get("http://127.0.0.1:8000/chat/notifications", headers={"x-access-token": host_token or ""}, timeout=2)
+            return r.json() if r.status_code == 200 else {"unread": {}, "notifications": []}
+        except Exception:
+            return {"unread": {}, "notifications": []}
+
+    def _mark_conversation_read(self, conversation_id, message_id=None):
+        if not conversation_id:
+            return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                result = self.brain.mark_chat_read(conversation_id, message_id)
+            else:
+                r = requests.post("http://127.0.0.1:8000/chat/read", json={"conversation_id": conversation_id, "message_id": message_id}, headers={"x-access-token": host_token or ""}, timeout=2)
+                result = r.json() if r.status_code == 200 else {}
+            self._unread_counts.pop(conversation_id, None)
+        except Exception:
+            pass
+
+    def _poll_notifications(self):
+        if self._closing or not self.chat_enabled:
+            return
+        data = self._notification_data()
+        unread = data.get("unread", {}) or {}
+        self._unread_counts = {str(k): int(v or 0) for k, v in unread.items() if int(v or 0) > 0}
+
+        # The currently open conversation is considered read, just like WhatsApp.
+        if self.tabs.currentIndex() == 2 and self.current_conversation_id in self._unread_counts:
+            self._mark_conversation_read(self.current_conversation_id)
+            self._unread_counts.pop(self.current_conversation_id, None)
+
+        self._render_chat_conversations()
+
+        for n in data.get("notifications", []) or []:
+            mid = n.get("id")
+            if not mid or mid in self._notified_message_ids:
+                continue
+            self._notified_message_ids.add(mid)
+            # Don't notify for the conversation currently being viewed.
+            if self.tabs.currentIndex() == 2 and n.get("conversation_id") == self.current_conversation_id:
+                continue
+            conv = next((c for c in self.chat_conversations if c.get("id") == n.get("conversation_id")), None) or {}
+            title = ("📣 Mention from " if n.get("mentioned") else "💬 New message from ") + str(n.get("sender", "Team member"))
+            body = str(n.get("message", ""))
+            if len(body) > 180:
+                body = body[:177] + "..."
+            if self._tray is not None:
+                try:
+                    self._tray.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, 5000)
+                except Exception:
+                    QApplication.beep()
+            else:
+                QApplication.beep()
+
+        # Keep the set bounded across long-running sessions.
+        if len(self._notified_message_ids) > 2000:
+            self._notified_message_ids = set(list(self._notified_message_ids)[-1000:])
+
+    # --------------------------------------------------------
     # BASIC UI
     # --------------------------------------------------------
 
@@ -1333,27 +1400,23 @@ class CoreApp(QMainWindow):
         self.lbl_activity.setText(text)
 
     def lock_ui(self):
-
+        # AI input only. Team Chat has its own independent controls and must
+        # never be disabled by Brain sync/polling state.
+        if getattr(self, "tabs", None) is not None and self.tabs.currentIndex() == 2:
+            self.update_chat_controls()
+            return
         self.inp.setEnabled(False)
         self.btn_send.setEnabled(False)
-
-        if isinstance(self.brain, RemoteBrain):
-            self.inp.setPlaceholderText(
-                "Waiting for Team Brain..."
-            )
-        else:
-            self.inp.setPlaceholderText(
-                "Load project to start..."
-            )
+        self.inp.setPlaceholderText("Waiting for Team Brain..." if isinstance(self.brain, RemoteBrain) else "Load project to start...")
 
     def unlock_ui(self):
-
+        # AI input only; never touch Team Chat state here.
+        if getattr(self, "tabs", None) is not None and self.tabs.currentIndex() == 2:
+            self.update_chat_controls()
+            return
         self.inp.setEnabled(True)
         self.btn_send.setEnabled(True)
-
-        self.inp.setPlaceholderText(
-            "Ask a question..."
-        )
+        self.inp.setPlaceholderText("Ask a question...")
 
     def handle_team_revoked(self):
         if not isinstance(self.brain, RemoteBrain):
@@ -1510,6 +1573,7 @@ class CoreApp(QMainWindow):
     def select_chat_conversation(self, row):
         if 0 <= row < len(self.chat_conversations):
             self.current_conversation_id = self.chat_conversations[row].get("id", "team")
+            self._mark_conversation_read(self.current_conversation_id)
             self.update_group_controls()
             self.refresh_chat_messages()
 
@@ -1853,8 +1917,39 @@ class CoreApp(QMainWindow):
     # MODE
     # --------------------------------------------------------
 
+    def _register_task_worker(self, worker):
+        """Keep every QThread wrapper alive until its native thread exits.
+
+        QThread emits result_signal before run() returns.  The old code stored
+        the worker in one shared self.worker attribute, so a new operation
+        (such as a mode switch) could garbage-collect the old wrapper while
+        its native thread was still finishing, producing:
+        "QThread: Destroyed while thread is still running".
+        """
+        if not hasattr(self, "_task_workers"):
+            self._task_workers = set()
+        self._task_workers.add(worker)
+        worker.finished.connect(lambda w=worker: self._task_worker_finished(w))
+        return worker
+
+    def _task_worker_finished(self, worker):
+        self._task_workers.discard(worker)
+        # Do not delete a QThread wrapper from inside its own finished signal
+        # until Qt has completed delivery. deleteLater() is the safe path.
+        try:
+            worker.deleteLater()
+        except Exception:
+            pass
+
+    def _task_worker_running(self):
+        return any(w is not None and w.isRunning() for w in getattr(self, "_task_workers", set()))
+
     def toggle_mode(self):
-        if isinstance(self.brain, RemoteBrain) or getattr(self, "_busy", False):
+        if (isinstance(self.brain, RemoteBrain) or getattr(self, "_busy", False)
+                or self._task_worker_running()):
+            # A Brain operation must finish completely before changing mode.
+            if self._task_worker_running() and not getattr(self, "_busy", False):
+                self.set_status("Please wait for the current operation to finish...")
             return
 
         desired = "append" if self.btn_mode.isChecked() else "single"
@@ -1909,6 +2004,10 @@ class CoreApp(QMainWindow):
                 )
 
             self.team_mode = mode
+            # A mode change changes the authoritative evidence set/rules; the
+            # previous My AI conversation must not be carried into it.
+            self.chat_history_log = []
+            self.chat.clear()
             self._busy = False
             self.btn_mode.setEnabled(True)
             self.poll_updates()
@@ -2117,6 +2216,10 @@ class CoreApp(QMainWindow):
         ):
             self._render_chat_messages(data.get("messages", []))
 
+        # Notifications are independent from Brain readiness.
+        if self.tabs.currentIndex() == 2 or data.get("conversations") is not None:
+            self._poll_notifications()
+
         users = data.get("users", [])
         self.user_list.clear()
         from PyQt6.QtWidgets import QListWidgetItem
@@ -2266,7 +2369,12 @@ class CoreApp(QMainWindow):
         selected = 0
         for i, conv in enumerate(self.chat_conversations):
             prefix = {"team":"# ","dm":"👤 ","group":"👥 "}.get(conv.get("type"), "")
-            self.chat_conversation_list.addItem(prefix + conv.get("name", conv.get("id", "Chat")))
+            cid = conv.get("id", "")
+            unread = int(getattr(self, "_unread_counts", {}).get(cid, 0) or 0)
+            label = prefix + conv.get("name", cid or "Chat")
+            if unread:
+                label += f"  🔴 {unread}"
+            self.chat_conversation_list.addItem(label)
             if conv.get("id") == self.current_conversation_id: selected = i
         if self.chat_conversation_list.count(): self.chat_conversation_list.setCurrentRow(selected)
         self.chat_conversation_list.blockSignals(False)
@@ -2341,13 +2449,13 @@ class CoreApp(QMainWindow):
                 'content': msg['content']
             })
 
-        self.worker = TaskWorker(
+        self.worker = self._register_task_worker(TaskWorker(
             self.brain,
             "query",
             text,
             public_flag=is_public,
             history=formatted_history
-        )
+        ))
 
         self.worker.result_signal.connect(
             lambda r: self.finish_query(
@@ -2486,13 +2594,13 @@ class CoreApp(QMainWindow):
         self.btn_mode.setEnabled(False)
         self.set_status("Indexing...")
 
-        self.worker = TaskWorker(
+        self.worker = self._register_task_worker(TaskWorker(
             self.brain,
             "ingest",
             files,
             is_append,
             extra="publish_team" if isinstance(self.brain, CoreBrain) else None
-        )
+        ))
         self.worker.msg_signal.connect(self.set_status)
         self.worker.result_signal.connect(self.finish_ingest)
         self.worker.start()
@@ -2500,12 +2608,17 @@ class CoreApp(QMainWindow):
     def finish_ingest(self, res):
         if "Success" not in str(res) and "Indexed" not in str(res) and "uploaded successfully" not in str(res).lower():
             self._busy = False
+            self.btn_new.setEnabled(True)
             self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
             self.set_status("Upload Failed")
             QMessageBox.warning(self, "Project Update Failed", str(res))
             return
 
         self._busy = False
+        # Brain changes define a new AI context. Do not let questions about an
+        # older file/session leak into the newly indexed project.
+        self.chat_history_log = []
+        self.btn_new.setEnabled(True)
         self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
         self.set_status("Ready")
         self.unlock_ui()
@@ -2545,10 +2658,10 @@ class CoreApp(QMainWindow):
         self._busy = True
         self.set_status("Syncing...")
 
-        self.worker = TaskWorker(
+        self.worker = self._register_task_worker(TaskWorker(
             self.brain,
             "sync_server"
-        )
+        ))
 
         self.worker.result_signal.connect(
             self.finish_sync
@@ -2602,12 +2715,12 @@ class CoreApp(QMainWindow):
             return
 
         self.set_status("Inviting...")
-        self.worker = TaskWorker(
+        self.worker = self._register_task_worker(TaskWorker(
             self.brain,
             "invite",
             name,
             extra=role
-        )
+        ))
         self.worker.result_signal.connect(self.show_invite_popup)
         self.worker.start()
 
@@ -2734,9 +2847,7 @@ class CoreApp(QMainWindow):
                             "font-weight:bold;"
                         )
 
-                        self.btn_new.setEnabled(
-                            True
-                        )
+                        self.btn_new.setEnabled(not getattr(self, "_busy", False))
 
                     else:
 
@@ -2753,9 +2864,7 @@ class CoreApp(QMainWindow):
                             "font-weight:bold;"
                         )
 
-                        self.btn_new.setEnabled(
-                            False
-                        )
+                        self.btn_new.setEnabled(False)
 
                     self.btn_join.setText(
                         "❌ Leave Team"
@@ -2884,9 +2993,7 @@ class CoreApp(QMainWindow):
                 True
             )
 
-            self.btn_new.setEnabled(
-                True
-            )
+            self.btn_new.setEnabled(not getattr(self, "_busy", False))
 
             self.lock_ui()
 
@@ -2947,10 +3054,9 @@ class CoreApp(QMainWindow):
             except Exception:
                 pass
 
-        # TaskWorkers are also QThreads. Never let the Python wrapper be
-        # destroyed while its native thread is still executing.
-        for attr in ("worker", "sync_worker"):
-            w = getattr(self, attr, None)
+        # TaskWorkers are also QThreads. Keep every wrapper alive and wait
+        # for all native threads before the window/application is destroyed.
+        for w in list(getattr(self, "_task_workers", set())):
             try:
                 if w is not None and w.isRunning():
                     w.requestInterruption()
@@ -3069,12 +3175,12 @@ class CoreApp(QMainWindow):
                 "Saving Session..."
             )
 
-            self.worker = TaskWorker(
+            self.worker = self._register_task_worker(TaskWorker(
                 self.brain,
                 "save_session",
                 path,
                 extra=self.chat_history_log
-            )
+            ))
 
             self.worker.result_signal.connect(
                 lambda res:
@@ -3111,11 +3217,11 @@ class CoreApp(QMainWindow):
                 "Loading Session..."
             )
 
-            self.worker = TaskWorker(
+            self.worker = self._register_task_worker(TaskWorker(
                 self.brain,
                 "load_session",
                 path
-            )
+            ))
 
             self.worker.result_signal.connect(
                 self.finish_load_session
@@ -3145,15 +3251,22 @@ class CoreApp(QMainWindow):
                     msg.get('srcs')
                 )
 
-            self.set_status(
-                "Session Loaded"
-            )
+            # An explicitly loaded session is allowed to restore its Brain.
+            # Publish it so the server and every collaborator use exactly the
+            # same restored evidence set; this is the ONLY normal path by which
+            # an older session's AI context becomes active again.
+            if isinstance(self.brain, CoreBrain):
+                self.set_status("Session Loaded — Publishing Brain...")
+                self.sync_worker = self._register_task_worker(TaskWorker(self.brain, "sync_server"))
+                self.sync_worker.result_signal.connect(
+                    lambda sync_res: self._finish_loaded_session_sync(sync_res)
+                )
+                self.sync_worker.start()
+            else:
+                self.set_status("Session Loaded")
+                self.unlock_ui()
 
-            self.unlock_ui()
-
-            self.btn_save_brain.setEnabled(
-                True
-            )
+            self.btn_save_brain.setEnabled(True)
 
         else:
 
@@ -3166,6 +3279,17 @@ class CoreApp(QMainWindow):
                 "Load Failed",
                 str(res)
             )
+
+    def _finish_loaded_session_sync(self, res):
+        if "SUCCESS" in str(res):
+            self.chat_history_log = list(self.chat_history_log)
+            self.set_status("Session Loaded & Team Brain Restored")
+            self.unlock_ui()
+            self.refresh_team_state_once()
+        else:
+            self.set_status("Session Brain Sync Failed")
+            QMessageBox.warning(self, "Session Loaded Locally", str(res))
+            self.unlock_ui()
 
     # --------------------------------------------------------
     # SAVE BRAIN
@@ -3186,11 +3310,11 @@ class CoreApp(QMainWindow):
                 "Saving Brain..."
             )
 
-            self.worker = TaskWorker(
+            self.worker = self._register_task_worker(TaskWorker(
                 self.brain,
                 "save_brain",
                 path
-            )
+            ))
 
             self.worker.result_signal.connect(
                 lambda res:
@@ -3234,11 +3358,11 @@ class CoreApp(QMainWindow):
                 return
             self._busy = True
             self.set_status("Loading Brain...")
-            self.worker = TaskWorker(
+            self.worker = self._register_task_worker(TaskWorker(
                 self.brain,
                 "load_brain",
                 path
-            )
+            ))
             self.worker.result_signal.connect(
                 self.finish_load_brain
             )
@@ -3246,14 +3370,16 @@ class CoreApp(QMainWindow):
 
     def finish_load_brain(self, res):
         if res == "Success":
+            self.chat_history_log = []
+            self.chat.clear()
             self.set_status("Publishing Team Brain...")
             self.btn_save_brain.setEnabled(True)
 
             # Loading a .brain is immediately synchronized to the server.
-            self.sync_worker = TaskWorker(
+            self.sync_worker = self._register_task_worker(TaskWorker(
                 self.brain,
                 "sync_server"
-            )
+            ))
             self.sync_worker.result_signal.connect(
                 self.finish_load_brain_sync
             )
@@ -3332,7 +3458,7 @@ if __name__ == "__main__":
     # ========================================================
 
     print("=" * 55)
-    print("          CODECHAT STARTING")
+    print("          CODECHAT STARTING — FRESH AI SESSION")
     print("=" * 55)
 
     # --------------------------------------------------------
@@ -3389,6 +3515,7 @@ if __name__ == "__main__":
 
     stop_server()
     stop_ngrok()
+    stop_ollama()
 
     sys.exit(
         exit_code
