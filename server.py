@@ -517,7 +517,7 @@ def get_chat_message_view(message):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "34.0", "service": "codechat-team-server", "ai_session_epoch": AI_SESSION_EPOCH}
+    return {"status": "ok", "version": "35.0", "service": "codechat-team-server", "ai_session_epoch": AI_SESSION_EPOCH}
 
 
 # ============================================================
@@ -711,9 +711,13 @@ def set_mode(mode_data: dict, user_data: dict = Depends(require_host)):
         previous = TEAM_MODE
         # append -> single is destructive by design: retain ONLY the newest source file.
         if previous == "append" and mode == "single" and TEAM_BRAIN_READY and brain.sources:
+            # IMPORTANT: changing MODE is NOT a new AI session. The user explicitly
+            # expects the current conversation/session to survive a mode switch.
+            # Only the authoritative evidence set is changed here.
             old_chunks = list(brain.chunks)
             old_sources = list(brain.sources)
             old_embeddings = np.asarray(brain.embeddings, dtype=np.float32).copy()
+            old_source_order = list(getattr(brain, "source_order", []) or [])
             old_history = list(brain.local_history)
             result = brain.retain_latest_file()
             if result.startswith("Retained"):
@@ -722,13 +726,21 @@ def set_mode(mode_data: dict, user_data: dict = Depends(require_host)):
                     brain.chunks = old_chunks
                     brain.sources = old_sources
                     brain.embeddings = old_embeddings
+                    brain.source_order = old_source_order
                     brain.local_history = old_history
                     raise HTTPException(status_code=500, detail=f"Could not persist Single Mode: {save_result}")
-                BRAIN_VERSION += 1
+            else:
+                raise HTTPException(status_code=409, detail=result)
 
+        # Mode is workspace configuration, NOT a session boundary.
+        # Do not clear USER_SESSIONS, CHAT_AI_SESSIONS, human chat, or Ollama.
         TEAM_MODE = mode
-        USER_SESSIONS.clear()
-        CHAT_AI_SESSIONS.clear()
+        brain.team_mode = mode
+        if hasattr(brain, "workspace_context") and isinstance(brain.workspace_context, dict):
+            brain.workspace_context["mode"] = mode
+        # Bump the authoritative workspace version so all clients can observe the
+        # mode transition without having their local AI conversation refreshed.
+        BRAIN_VERSION += 1
 
     record_event(
         "mode_changed",
@@ -1704,7 +1716,7 @@ def initialize_server():
         # membership/history metadata may be retained for the team UI, but the
         # Team Brain and all AI conversation memory are intentionally discarded.
         # A saved .brain/.ccsession becomes active only through an explicit Load.
-        global TEAM_BRAIN_READY, BRAIN_VERSION, CHAT_AI_SESSIONS, USER_SESSIONS
+        global TEAM_BRAIN_READY, BRAIN_VERSION, TEAM_MODE, CHAT_AI_SESSIONS, USER_SESSIONS
         brain.chunks = []
         brain.sources = []
         brain.embeddings = []
@@ -1713,6 +1725,9 @@ def initialize_server():
         brain.workspace_context = {}
         TEAM_BRAIN_READY = False
         BRAIN_VERSION = 0
+        # TEAM_MODE must be reset as part of the fresh-server boundary. Without
+        # declaring it global this assignment would create a local variable and
+        # accidentally leave the persisted previous mode active.
         TEAM_MODE = "single"
         USER_SESSIONS = {}
         CHAT_AI_SESSIONS = {}
@@ -1724,7 +1739,7 @@ if __name__ == "__main__":
     initialize_server()
     print("\n" + "=" * 55)
     print("       🚀 CODECHAT TEAM SERVER")
-    print("       VERSION 34.0")
+    print("       VERSION 35.0")
     print("=" * 55 + "\n")
 
     print("🧹 Fresh AI session: no previous Brain or AI conversation was restored.")

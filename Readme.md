@@ -2,7 +2,7 @@
 
 > **Privacy-first local RAG desktop application for secure AI-assisted team collaboration.**
 
-![Version](https://img.shields.io/badge/version-34.0-blue.svg)
+![Version](https://img.shields.io/badge/version-35.0-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)
 ![GUI](https://img.shields.io/badge/GUI-PyQt6-green.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-red.svg)
@@ -1578,3 +1578,12 @@ Version 22 fixes Team Chat transport and QThread lifecycle issues. Human chat is
 - Every retrieved context block is labeled with both its logical source and filename.
 - Single Mode is server-authoritative and contains exactly the latest uploaded logical file. Append Mode retains multiple logical files in upload order. Switching Append → Single keeps only the latest file.
 - Collaborators cannot create the first Team Brain; Host initialization is required.
+
+
+### v35 session + mode rule
+- Switching Single/Append mode NEVER starts or refreshes an AI session.
+- The current My AI conversation and Ollama runtime remain alive during a mode switch.
+- A fresh AI/session boundary occurs only when CodeChat is closed and started again.
+- Append → Single keeps only the latest logical file, but does not erase the current conversation.
+- Single → Append changes only the future upload policy; existing Brain content remains unchanged.
+- Every new application launch starts a fresh isolated Ollama server and empty Team Brain unless the user explicitly loads a saved Brain/session.

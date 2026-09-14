@@ -114,7 +114,7 @@ def start_server():
             return False
         try:
             r = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
-            if r.status_code == 200 and str(r.json().get("version", "")) == "34.0":
+            if r.status_code == 200 and str(r.json().get("version", "")) == "35.0":
                 print(f"✅ Fresh CodeChat server started | AI epoch {r.json().get('ai_session_epoch', '?')}")
                 return True
         except requests.RequestException:
@@ -2004,10 +2004,10 @@ class CoreApp(QMainWindow):
                 )
 
             self.team_mode = mode
-            # A mode change changes the authoritative evidence set/rules; the
-            # previous My AI conversation must not be carried into it.
-            self.chat_history_log = []
-            self.chat.clear()
+            # IMPORTANT: mode switching is NOT a new session. Preserve the current
+            # My AI conversation exactly as-is. The server remains authoritative
+            # about which files are searchable, while the current Ollama/session
+            # context stays alive until the application is closed/restarted.
             self._busy = False
             self.btn_mode.setEnabled(True)
             self.poll_updates()

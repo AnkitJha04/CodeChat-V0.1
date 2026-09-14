@@ -240,7 +240,8 @@ class CoreBrain:
             self.sources = [self.sources[i] for i in keep]
             self.embeddings = np.asarray(self.embeddings, dtype=np.float32)[keep]
             self.source_order = [latest]
-            self.local_history = []
+            # Do NOT clear local_history here. Mode changes are not session
+            # boundaries; only a fresh app launch starts a fresh AI session.
             return f"Retained latest file: {os.path.basename(latest)}"
 
     def context_summary(self):
