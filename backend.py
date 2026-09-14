@@ -6,6 +6,65 @@ import zipfile
 import concurrent.futures
 import requests
 import json
+import tempfile
+import threading
+
+
+def _is_cuda_failure(exc):
+    """Return True for Ollama GPU/CUDA runner failures that are often recoverable by CPU fallback."""
+    text = str(exc).lower()
+    return any(token in text for token in (
+        "cuda error", "cuda", "llama runner process has terminated",
+        "out of memory", "cublas", "gpu memory"
+    ))
+
+def _friendly_ollama_error(exc, operation="AI"):
+    """Turn noisy Ollama runner failures into a useful, non-crashing CodeChat message."""
+    text = str(exc).strip()
+    if _is_cuda_failure(exc):
+        return (
+            "⚠️ CodeChat AI is temporarily unavailable because Ollama's GPU/CUDA runner failed.\n\n"
+            "CodeChat kept Team Chat running normally and automatically attempted a CPU fallback. "
+            "If the problem continues, close other GPU-heavy apps or restart Ollama/CodeChat.\n\n"
+            f"Technical detail: {text}"
+        )
+    if "connection" in text.lower() or "11434" in text:
+        return (
+            "⚠️ Ollama is not responding right now.\n\n"
+            "Please make sure Ollama is running, then try again. "
+            "Your Team Chat remains available.\n\n"
+            f"Technical detail: {text}"
+        )
+    return f"⚠️ {operation} failed safely: {text}"
+
+def _ollama_embeddings_with_fallback(model, prompt):
+    """Try normal GPU inference first, then retry on CPU for CUDA runner failures."""
+    try:
+        return ollama.embeddings(model=model, prompt=prompt)
+    except Exception as first_error:
+        if not _is_cuda_failure(first_error):
+            raise
+        # Ollama accepts num_gpu in model options. CPU fallback lets CodeChat
+        # recover from a broken/overloaded CUDA runner without killing the app.
+        try:
+            return ollama.embeddings(model=model, prompt=prompt, options={"num_gpu": 0})
+        except Exception as cpu_error:
+            raise RuntimeError(_friendly_ollama_error(cpu_error, "Embedding")) from cpu_error
+
+def _ollama_chat_with_fallback(model, messages, options=None):
+    """Try normal GPU inference first, then retry the same request on CPU."""
+    base_options = dict(options or {})
+    try:
+        return ollama.chat(model=model, messages=messages, options=base_options, stream=False)
+    except Exception as first_error:
+        if not _is_cuda_failure(first_error):
+            raise
+        cpu_options = dict(base_options)
+        cpu_options["num_gpu"] = 0
+        try:
+            return ollama.chat(model=model, messages=messages, options=cpu_options, stream=False)
+        except Exception as cpu_error:
+            raise RuntimeError(_friendly_ollama_error(cpu_error, "AI response")) from cpu_error
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
@@ -22,6 +81,20 @@ class CoreBrain:
         self.model = "llama3.1" 
         self.embed_file = "temp_vectors.npy"
         self.meta_file = "temp_metadata.pkl"
+        self._lock = threading.RLock()
+        # Team/AI context is optional but must always exist for both local and remote brains.
+        self.team_mode = "single"
+        self.workspace_context = {}
+
+    def _ensure_runtime_state(self):
+        # Defensive compatibility for old/frozen CoreBrain instances.
+        # Never assume attributes introduced by a newer build already exist.
+        if not hasattr(self, "workspace_context") or not isinstance(getattr(self, "workspace_context", None), dict):
+            self.workspace_context = {}
+        if not hasattr(self, "team_mode"):
+            self.team_mode = "single"
+        if not hasattr(self, "local_history") or self.local_history is None:
+            self.local_history = []
 
     def _read_file(self, file_path):
         try:
@@ -42,83 +115,221 @@ class CoreBrain:
             return [(content, file_path)]
         except: return []
 
-    def ingest_codebase(self, folder_path, callback_fn, append_mode=False):
-        if not append_mode:
-            self.chunks = []; self.embeddings = []; self.sources = []; self.local_history = []
-            callback_fn("🧹 Memory wiped. Starting fresh...")
-        
-        files = []
-        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
-        for r, d, f in os.walk(folder_path):
-            if any(x in r for x in ['node_modules', '.git', 'venv', '__pycache__']): continue
-            for file in f:
-                if os.path.splitext(file)[1] in valid:
-                    files.append(os.path.join(r, file))
+    def ingest_codebase(self, paths, callback_fn, append_mode=False):
+        """Index one file in Single mode or one/more selected files in Append mode.
+        The Brain is modified only after successful embedding, so failed uploads
+        never destroy a previously working Brain.
+        """
+        if isinstance(paths, (str, os.PathLike)):
+            paths = [str(paths)]
+        paths = [str(x) for x in (paths or []) if os.path.isfile(str(x))]
+        if not paths:
+            return "No valid file selected."
 
-        if not files: return "No new files found."
-        
-        callback_fn(f"📖 Reading {len(files)} files...")
+        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
+        files = [x for x in paths if os.path.splitext(x)[1].lower() in valid]
+        if not files:
+            return "No supported files selected."
+
+        callback_fn(f"📖 Reading {len(files)} selected file{'s' if len(files) != 1 else ''}...")
         data = []
-        with concurrent.futures.ThreadPoolExecutor() as ex:
-            res = ex.map(self._read_file, files)
-            for r in res: data.extend(r)
-        
-        return self._embed_data(data, callback_fn)
+        for file_path in files:
+            data.extend(self._read_file(file_path))
+
+        return self._embed_data(data, callback_fn, replace=not append_mode)
 
     def ingest_remote_data(self, file_data_list, callback_fn, append_mode=True):
-        if not append_mode:
-            self.chunks = []; self.embeddings = []; self.sources = []; self.local_history = []
-            callback_fn("🧹 Server Brain Wiped (Single Mode Active)")
-        return self._embed_data(file_data_list, callback_fn)
+        return self._embed_data(
+            file_data_list,
+            callback_fn,
+            replace=not append_mode
+        )
 
-    def _embed_data(self, data_tuples, callback_fn):
+    def _embed_data(self, data_tuples, callback_fn, replace=False):
+        data_tuples = [(str(c), str(p)) for c, p in data_tuples if str(c).strip()]
         total = len(data_tuples)
+        if total == 0:
+            return "No valid content found."
+
         callback_fn(f"🧠 Embedding {total} chunks...")
-        new_vecs = []
-        
+        new_chunks, new_sources, new_vecs = [], [], []
+        failures = 0
+
         for i, (chunk, path) in enumerate(data_tuples):
             try:
-                self.chunks.append(chunk)
-                self.sources.append(path)
-                resp = ollama.embeddings(model=self.model, prompt=chunk)
-                new_vecs.append(resp['embedding'])
-                if i % 5 == 0: callback_fn(f"⚡ Processing: {int((i/total)*100)}%")
-            except: pass
-            
-        if new_vecs:
-            new_np = np.array(new_vecs)
-            if len(self.embeddings) == 0:
+                resp = _ollama_embeddings_with_fallback(self.model, chunk)
+                vec = resp.get('embedding')
+                if not vec:
+                    raise RuntimeError("Ollama returned an empty embedding")
+                new_chunks.append(chunk)
+                new_sources.append(path)
+                new_vecs.append(vec)
+                if i == 0 or (i + 1) % 5 == 0 or i + 1 == total:
+                    callback_fn(f"⚡ Processing: {int(((i + 1) / total) * 100)}%")
+            except Exception as e:
+                failures += 1
+                callback_fn(f"⚠️ Skipped chunk {i + 1}/{total}: {e}")
+
+        if not new_vecs:
+            return "Error: No chunks could be embedded. Check Ollama and the model."
+
+        new_np = np.asarray(new_vecs, dtype=np.float32)
+        with self._lock:
+            if replace:
+                self.chunks = list(new_chunks)
+                self.sources = list(new_sources)
                 self.embeddings = new_np
+                self.local_history = []
             else:
-                self.embeddings = np.concatenate((self.embeddings, new_np), axis=0)
-        
-        return f"Success: Indexed {total} chunks."
+                self.chunks.extend(new_chunks)
+                self.sources.extend(new_sources)
+                if len(self.embeddings) == 0:
+                    self.embeddings = new_np
+                else:
+                    self.embeddings = np.concatenate(
+                        (np.asarray(self.embeddings, dtype=np.float32), new_np),
+                        axis=0
+                    )
+
+        msg = f"Success: Indexed {len(new_vecs)} chunks from {len(set(new_sources))} file{'s' if len(set(new_sources)) != 1 else ''}."
+        if failures:
+            msg += f" Skipped {failures} failed chunks."
+        return msg
+
+    def retain_latest_file(self):
+        """Single-mode invariant: retain only the most recently ingested source file."""
+        with self._lock:
+            if not self.sources or len(self.sources) != len(self.chunks):
+                return "No Brain data to reduce."
+            latest = self.sources[-1]
+            keep = [i for i, src in enumerate(self.sources) if src == latest]
+            if not keep:
+                return "No latest file found."
+            self.chunks = [self.chunks[i] for i in keep]
+            self.sources = [self.sources[i] for i in keep]
+            self.embeddings = np.asarray(self.embeddings, dtype=np.float32)[keep]
+            self.local_history = []
+            return f"Retained latest file: {os.path.basename(latest)}"
+
+    def context_summary(self):
+        self._ensure_runtime_state()
+        with self._lock:
+            files = []
+            seen = set()
+            for src in self.sources:
+                name = os.path.basename(str(src))
+                if name not in seen:
+                    seen.add(name)
+                    files.append(name)
+            return {
+                "brain_type": "local",
+                "mode": getattr(self, "team_mode", "single"),
+                "file_count": len(files),
+                "files": files[-50:],
+                "chunk_count": len(self.chunks),
+                "team": dict(getattr(self, "workspace_context", {}) or {}),
+            }
+
+    def publish_files_to_server(self, paths, callback_fn, append_mode=False):
+        """Authoritatively update the Team Brain from the Host.
+        The server performs the embedding and returns a snapshot; the Host then
+        replaces its local Brain with that authoritative snapshot.
+        """
+        if isinstance(paths, (str, os.PathLike)):
+            paths = [str(paths)]
+        paths = [str(x) for x in (paths or []) if os.path.isfile(str(x))]
+        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.h', '.hpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
+        files_data = []
+        for full in paths:
+            if os.path.splitext(full)[1].lower() not in valid:
+                continue
+            try:
+                with open(full, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if content.strip():
+                    files_data.append({"text": content, "source": f"HostUpload/{os.path.basename(full)}"})
+            except Exception as e:
+                callback_fn(f"⚠️ Skipped {os.path.basename(full)}: {e}")
+
+        if not files_data:
+            return "No valid file content found."
+
+        callback_fn(f"📤 Publishing {len(files_data)} file{'s' if len(files_data) != 1 else ''} to Team Brain...")
+        try:
+            token = os.environ.get("CODECHAT_HOST_TOKEN", "")
+            res = requests.post(
+                "http://127.0.0.1:8000/ingest",
+                json={"chunks": files_data, "append_mode": bool(append_mode)},
+                headers={"x-access-token": token},
+                timeout=180
+            )
+            if res.status_code != 200:
+                return f"Server Error: {res.text}"
+
+            callback_fn("📥 Refreshing authoritative Team Brain...")
+            snap = requests.get(
+                "http://127.0.0.1:8000/download_brain",
+                headers={"x-access-token": token},
+                timeout=60
+            )
+            if snap.status_code != 200:
+                return f"Server Error while downloading Team Brain: {snap.text}"
+
+            fd, temp_path = tempfile.mkstemp(prefix="codechat_host_refresh_", suffix=".brain")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(snap.content)
+                load_res = self.load_snapshot(temp_path)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+            if "Success" not in load_res:
+                return f"Could not refresh local Team Brain: {load_res}"
+            return "Success: Team Brain updated and synchronized."
+        except Exception as e:
+            return f"Connection Error: {e}"
 
     def save_snapshot(self, filepath):
         try:
-            if len(self.embeddings) == 0: return "Error: Brain is empty."
-            np.save(self.embed_file, self.embeddings)
-            with open(self.meta_file, 'wb') as f:
-                pickle.dump({'chunks': self.chunks, 'sources': self.sources}, f)
-            with zipfile.ZipFile(filepath, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
-                zf.write(self.embed_file); zf.write(self.meta_file)
-            if os.path.exists(self.embed_file): os.remove(self.embed_file)
-            if os.path.exists(self.meta_file): os.remove(self.meta_file)
-            return "Success"
-        except Exception as e: return str(e)
+            with self._lock:
+                if len(self.embeddings) == 0 or len(self.chunks) != len(self.embeddings):
+                    return "Error: Brain is empty or inconsistent."
+                target = os.path.abspath(filepath)
+                os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+                with tempfile.TemporaryDirectory(prefix="codechat_snapshot_") as td:
+                    emb = os.path.join(td, "vectors.npy")
+                    meta = os.path.join(td, "metadata.pkl")
+                    np.save(emb, np.asarray(self.embeddings, dtype=np.float32))
+                    with open(meta, 'wb') as f:
+                        pickle.dump({'chunks': list(self.chunks), 'sources': list(self.sources)}, f)
+                    with zipfile.ZipFile(target, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+                        zf.write(emb, "temp_vectors.npy")
+                        zf.write(meta, "temp_metadata.pkl")
+                return "Success"
+        except Exception as e:
+            return str(e)
 
     def load_snapshot(self, filepath):
         try:
-            if not os.path.exists(filepath): return "File not found"
-            self.chunks = []; self.sources = []; self.embeddings = []
-            with zipfile.ZipFile(filepath, 'r') as zf: zf.extractall(".")
-            self.embeddings = np.load(self.embed_file)
-            with open(self.meta_file, 'rb') as f:
-                d = pickle.load(f)
-                self.chunks = d['chunks']; self.sources = d['sources']
-            if os.path.exists(self.embed_file): os.remove(self.embed_file)
-            if os.path.exists(self.meta_file): os.remove(self.meta_file)
-            return "Success"
+            target = os.path.abspath(filepath)
+            if not os.path.exists(target): return "File not found"
+            with tempfile.TemporaryDirectory(prefix="codechat_load_") as td:
+                with zipfile.ZipFile(target, 'r') as zf:
+                    names = set(zf.namelist())
+                    if 'temp_vectors.npy' not in names or 'temp_metadata.pkl' not in names:
+                        return "Invalid Brain file."
+                    zf.extract('temp_vectors.npy', td)
+                    zf.extract('temp_metadata.pkl', td)
+                emb = np.load(os.path.join(td, 'temp_vectors.npy'), allow_pickle=False)
+                with open(os.path.join(td, 'temp_metadata.pkl'), 'rb') as f:
+                    d = pickle.load(f)
+                chunks = d.get('chunks', []); sources = d.get('sources', [])
+                if len(chunks) != len(sources) or len(chunks) != len(emb):
+                    return "Invalid Brain file: chunks and embeddings are inconsistent."
+                with self._lock:
+                    self.chunks = chunks; self.sources = sources; self.embeddings = np.asarray(emb, dtype=np.float32)
+                return "Success"
         except Exception as e: return str(e)
 
     def get_team_chat(self):
@@ -149,22 +360,31 @@ class CoreBrain:
         except: return []
 
     def ask_question(self, query, history=None, is_public=False):
+        self._ensure_runtime_state()
         if not self.chunks or len(self.embeddings) == 0: 
             return "❌ Brain is empty. Please load code on Host and click Sync.", []
 
         active_history = history if history is not None else self.local_history
 
         try:
-            q_vec = np.array(ollama.embeddings(model=self.model, prompt=query)['embedding'])
+            q_vec = np.array(_ollama_embeddings_with_fallback(self.model, query)['embedding'])
             sims = np.dot(self.embeddings, q_vec)
             top_idx = np.argsort(sims)[-5:][::-1]
             ctx = "\n\n".join([self.chunks[i] for i in top_idx])
             srcs = [self.sources[i] for i in top_idx]
-        except Exception as e: return f"❌ Retrieval Error: {str(e)}", []
+        except Exception as e: return _friendly_ollama_error(e, "Retrieval"), []
 
+        info = self.context_summary()
+        file_list = ", ".join(info["files"]) if info["files"] else "No indexed files"
         system_msg = (
-            "You are an expert Developer. "
+            "You are CodeChat AI, the AI assistant inside CodeChat Pro Team Edition. "
+            "You know that you are working inside a code/document workspace. "
             "Use the provided Context to answer the user's technical question. "
+            "You may answer questions about your workspace only from the workspace metadata below "
+            "and retrieved context; never invent filenames, counts, roles, or team facts. "
+            f"\n\nWorkspace metadata: {info['file_count']} indexed files, "
+            f"{info['chunk_count']} chunks. Files: {file_list}. "
+            f"Team context: {info.get('team', {})}. "
             f"\n\nContext:\n{ctx}"
         )
 
@@ -173,11 +393,10 @@ class CoreBrain:
         msgs.append({'role': 'user', 'content': query})
 
         try:
-            res = ollama.chat(
-                model=self.model, 
-                messages=msgs,
-                options={'num_ctx': 4096},
-                stream=False 
+            res = _ollama_chat_with_fallback(
+                self.model,
+                msgs,
+                options={'num_ctx': 4096}
             )
             ans = res['message']['content']
             
@@ -189,7 +408,7 @@ class CoreBrain:
                 except: pass
             
             return ans, srcs
-        except Exception as e: return f"AI Error: {e}", []
+        except Exception as e: return _friendly_ollama_error(e, "AI response"), []
 
 class RemoteBrain:
     def __init__(self, url, token):
@@ -325,6 +544,19 @@ class RemoteBrain:
         except Exception:
             return {"messages": []}
 
+    def delete_chat_conversation(self, conversation_id):
+        try:
+            res = requests.delete(
+                f"{self.url}/chat/conversations/{conversation_id}",
+                headers=self.headers,
+                timeout=5
+            )
+            if res.status_code == 200:
+                return res.json()
+            return {"error": self._error_from_response(res)}
+        except Exception as e:
+            return {"error": f"❌ Connection Error: {e}"}
+
     def send_chat_message(self, text, conversation_id=None):
         try:
             payload = {"text": text}
@@ -383,6 +615,32 @@ class RemoteBrain:
         except Exception as e:
             return {"error": f"❌ Connection Error: {e}"}
 
+    def leave_group(self, group_id):
+        try:
+            res = requests.post(
+                f"{self.url}/chat/groups/{group_id}/leave",
+                headers=self.headers,
+                timeout=5
+            )
+            if res.status_code == 200:
+                return res.json()
+            return {"error": self._error_from_response(res)}
+        except Exception as e:
+            return {"error": f"❌ Connection Error: {e}"}
+
+    def delete_group(self, group_id):
+        try:
+            res = requests.delete(
+                f"{self.url}/chat/groups/{group_id}",
+                headers=self.headers,
+                timeout=5
+            )
+            if res.status_code == 200:
+                return res.json()
+            return {"error": self._error_from_response(res)}
+        except Exception as e:
+            return {"error": f"❌ Connection Error: {e}"}
+
     def toggle_chat(self, enabled):
         try:
             res = requests.post(
@@ -424,49 +682,44 @@ class RemoteBrain:
         except Exception as e:
             return {"error": f"❌ Connection Error: {e}"}
 
-    def ingest_codebase(self, folder_path, callback_fn, append_mode=True):
-        callback_fn("📤 Scanning files...")
-        files_data = []
+    def ingest_codebase(self, paths, callback_fn, append_mode=True):
+        if isinstance(paths, (str, os.PathLike)):
+            paths = [str(paths)]
+        paths = [str(x) for x in (paths or []) if os.path.isfile(str(x))]
         valid = {'.py', '.js', '.ts', '.c', '.cpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
-        for r, d, f in os.walk(folder_path):
-            if any(x in r for x in ['node_modules', '.git', 'venv', '__pycache__']):
-                continue
-            for file in f:
-                if os.path.splitext(file)[1] in valid:
-                    try:
-                        with open(os.path.join(r, file), 'r', encoding='utf-8', errors='ignore') as fo:
-                            content = fo.read()
-                        if content.strip():
-                            files_data.append({
-                                "text": content,
-                                "source": f"RemoteUpload/{file}"
-                            })
-                    except Exception:
-                        pass
+        files = [x for x in paths if os.path.splitext(x)[1].lower() in valid]
+        if not files:
+            return "No supported files selected."
+
+        callback_fn(f"📤 Preparing {len(files)} file{'s' if len(files) != 1 else ''}...")
+        files_data = []
+        for full in files:
+            try:
+                with open(full, 'r', encoding='utf-8', errors='ignore') as fo:
+                    content = fo.read()
+                if content.strip():
+                    rel = os.path.basename(full)
+                    files_data.append({"text": content, "source": f"RemoteUpload/{rel}"})
+            except Exception as e:
+                callback_fn(f"⚠️ Skipped {os.path.basename(full)}: {e}")
 
         if not files_data:
-            return "No valid files found."
+            return "No valid file content found."
 
-        total = len(files_data)
-        batch_size = 5
-        callback_fn(f"🚀 Uploading {total} files in batches...")
-        for i in range(0, total, batch_size):
-            batch = files_data[i:i + batch_size]
-            try:
-                res = requests.post(
-                    f"{self.url}/ingest",
-                    json={"chunks": batch, "append_mode": True},
-                    headers=self.headers,
-                    timeout=30
-                )
-                if res.status_code != 200:
-                    return f"❌ Failed at file {i}: {self._error_from_response(res)}"
-                callback_fn(f"✅ Uploaded {min(i + batch_size, total)}/{total}")
-            except Exception as e:
-                return f"❌ Connection Lost: {e}"
-
-        self.get_team_state()
-        return "✅ All Files Uploaded Successfully"
+        callback_fn(f"🚀 Uploading {len(files_data)} file{'s' if len(files_data) != 1 else ''} as one atomic Team Brain update...")
+        try:
+            res = requests.post(
+                f"{self.url}/ingest",
+                json={"chunks": files_data, "append_mode": bool(append_mode)},
+                headers=self.headers,
+                timeout=180
+            )
+            if res.status_code != 200:
+                return self._error_from_response(res)
+            self.get_team_state()
+            return "✅ All selected files uploaded successfully"
+        except Exception as e:
+            return f"❌ Connection Lost: {e}"
 
     def save_snapshot(self, filepath):
         try:

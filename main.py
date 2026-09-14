@@ -7,9 +7,12 @@ import speech_recognition as sr
 import requests
 import json
 import base64
+from pathlib import Path
 import secrets
 import zipfile
 import shutil
+import tempfile
+import html
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -17,10 +20,10 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QTextBrowser, QLineEdit, QPushButton,
     QFileDialog, QLabel, QFrame, QInputDialog, QMessageBox,
     QDialog, QRadioButton, QTextEdit, QTabWidget,
-    QListWidget
+    QListWidget, QListWidgetItem, QCheckBox, QDialogButtonBox
 )
 
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QRunnable, QThreadPool, QObject
 
 from backend import CoreBrain, RemoteBrain
 from styles import (
@@ -46,160 +49,121 @@ host_token = None
 
 def start_server():
     global server_process, host_token
-
-    # Check if server is already running
+    data_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "CodeChat")
+    os.makedirs(data_dir, exist_ok=True)
+    token_file = os.path.join(data_dir, "host.token")
     try:
-        response = requests.get(
-            "http://127.0.0.1:8000/health",
-            timeout=2
-        )
+        if not host_token and os.path.exists(token_file):
+            host_token = Path(token_file).read_text(encoding="utf-8").strip()
+        if not host_token:
+            host_token = secrets.token_hex(32)
+            Path(token_file).write_text(host_token, encoding="utf-8")
+        os.environ["CODECHAT_HOST_TOKEN"] = host_token
+    except Exception:
+        if not host_token: host_token = secrets.token_hex(32)
 
-        if response.status_code == 200:
-            print("✅ CodeChat server already running.")
-            return True
+    def server_responding():
+        try:
+            r = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
+            return r.status_code == 200 and str(r.json().get("version", "")) == "29.0"
+        except requests.RequestException:
+            return False
 
+    try:
+        health = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
+        if health.status_code == 200:
+            hv = str(health.json().get("version", ""))
+            if hv == "29.0":
+                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token}, timeout=2)
+                if r.status_code == 200:
+                    print("✅ CodeChat v22 server already running and synchronized.")
+                    return True
+            print(f"⚠️ Old/stale CodeChat server detected (version {hv}); restarting it.")
+            if sys.platform == "win32":
+                try:
+                    out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
+                    pids = set()
+                    for line in out.splitlines():
+                        if ":8000" in line and "LISTENING" in line:
+                            parts = line.split()
+                            if parts: pids.add(parts[-1])
+                    for pid in pids:
+                        if pid.isdigit():
+                            subprocess.run(["taskkill", "/F", "/PID", pid], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    time.sleep(1)
+                except Exception as e:
+                    print(f"⚠️ Could not reset stale server: {e}")
+            else:
+                print("⚠️ Port 8000 is occupied by a non-Windows process; please stop it before restarting CodeChat.")
     except requests.RequestException:
         pass
 
     print("🚀 Starting CodeChat server...")
-
-    # ---------------------------------------------
-    # Build correct command
-    # ---------------------------------------------
-    # When running from source:
-    #     python main.py
-    # becomes:
-    #     python main.py --server
-    #
-    # When running as a PyInstaller executable:
-    #     CodeChat.exe
-    # becomes:
-    #     CodeChat.exe --server
-    #
-    # IMPORTANT:
-    # In source mode we MUST include the path to main.py.
-    # Otherwise Python interprets "--server" as a Python
-    # interpreter option and exits with:
-    #     unknown option --server
-    # ---------------------------------------------
     if getattr(sys, "frozen", False):
-        server_command = [
-            sys.executable,
-            "--server"
-        ]
+        server_command = [sys.executable, "--server"]
+        run_dir = os.path.dirname(sys.executable)
     else:
-        server_command = [
-            sys.executable,
-            os.path.abspath(__file__),
-            "--server"
-        ]
-
-    # ---------------------------------------------
-    # Start server
-    # ---------------------------------------------
-    creation_flags = 0
-
-    if sys.platform == "win32":
-        creation_flags = subprocess.CREATE_NO_WINDOW
-
+        server_command = [sys.executable, os.path.abspath(__file__), "--server"]
+        run_dir = os.path.dirname(os.path.abspath(__file__))
     server_env = os.environ.copy()
-    if host_token:
-        server_env["CODECHAT_HOST_TOKEN"] = host_token
-
-    server_process = subprocess.Popen(
-        server_command,
-        creationflags=creation_flags,
-        cwd=os.path.dirname(os.path.abspath(__file__)),
-        env=server_env
-    )
-
-    # ---------------------------------------------
-    # Wait for server
-    # ---------------------------------------------
+    server_env["CODECHAT_HOST_TOKEN"] = host_token
+    server_env["CODECHAT_PROJECT_DIR"] = os.path.dirname(os.path.abspath(__file__)) if not getattr(sys, "frozen", False) else os.path.dirname(sys.executable)
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        server_process = subprocess.Popen(server_command, creationflags=flags, cwd=run_dir, env=server_env)
+    except Exception as e:
+        print(f"❌ Server launch failed: {e}"); server_process = None; return False
     print("⏳ Waiting for CodeChat server...")
-
-    for _ in range(30):
-        time.sleep(1)
-
-        # Check if process died
+    for _ in range(40):
+        time.sleep(0.5)
         if server_process.poll() is not None:
-            print("❌ Server process stopped unexpectedly.")
-            server_process = None
-            return False
-
-        try:
-            response = requests.get(
-                "http://127.0.0.1:8000/health",
-                timeout=1
-            )
-
-            if response.status_code == 200:
-                print("✅ CodeChat server started successfully.")
-                return True
-
-        except requests.RequestException:
-            pass
-
-    print("❌ CodeChat server failed to start.")
-    return False
+            print("❌ Server process stopped unexpectedly."); server_process = None; return False
+        if server_responding():
+            try:
+                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token}, timeout=2)
+                if r.status_code == 200:
+                    print("✅ CodeChat server started successfully."); return True
+            except requests.RequestException: pass
+    print("❌ CodeChat server failed to start."); return False
 
 
 def start_ngrok():
     global ngrok_process, public_url
-
     print("🌐 Starting ngrok...")
-
+    # Reuse an already-running local ngrok tunnel when possible.
     try:
-        # Start ngrok
-        creation_flags = 0
-
-        if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NO_WINDOW
-
-        ngrok_process = subprocess.Popen(
-            ["ngrok", "http", "8000"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creation_flags
-        )
-
-        # Wait for ngrok API
-        for _ in range(15):
-            time.sleep(1)
-
+        r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=1.5)
+        if r.status_code == 200:
+            for tunnel in r.json().get("tunnels", []):
+                if tunnel.get("proto") == "https":
+                    public_url = tunnel.get("public_url")
+                    if public_url:
+                        print(f"✅ Existing ngrok tunnel reused: {public_url}"); return True
+    except requests.RequestException: pass
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        ngrok_exe = os.path.join(base, "ngrok.exe")
+        if not os.path.exists(ngrok_exe): ngrok_exe = shutil.which("ngrok") or "ngrok"
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        ngrok_process = subprocess.Popen([ngrok_exe, "http", "8000"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+        for _ in range(30):
+            time.sleep(0.5)
+            if ngrok_process.poll() is not None: break
             try:
-                response = requests.get(
-                    "http://127.0.0.1:4040/api/tunnels",
-                    timeout=2
-                )
-
-                if response.status_code == 200:
-                    tunnels = response.json().get("tunnels", [])
-
-                    for tunnel in tunnels:
+                r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=1.5)
+                if r.status_code == 200:
+                    for tunnel in r.json().get("tunnels", []):
                         if tunnel.get("proto") == "https":
-                            public_url = tunnel["public_url"]
-
-                            print("✅ ngrok started successfully.")
-                            print(f"🌍 Public URL: {public_url}")
-
-                            return True
-
-            except requests.RequestException:
-                pass
-
-        print("❌ Could not obtain ngrok public URL.")
-        return False
-
+                            public_url = tunnel.get("public_url")
+                            if public_url:
+                                print(f"✅ ngrok started successfully.\n🌍 Public URL: {public_url}"); return True
+            except requests.RequestException: pass
+        print("❌ Could not obtain ngrok public URL."); return False
     except FileNotFoundError:
-        print("❌ ngrok.exe not found.")
-        print("   Install ngrok or place ngrok.exe in PATH.")
-        return False
-
+        print("❌ ngrok.exe not found. Place ngrok.exe beside CodeChat.exe or add it to PATH."); return False
     except Exception as e:
-        print(f"❌ ngrok failed: {e}")
-        return False
-    
+        print(f"❌ ngrok failed: {e}"); return False
+
 
 def stop_server():
     """
@@ -402,115 +366,46 @@ class TaskWorker(QThread):
                 )
 
             elif self.task == "save_session":
-
                 try:
-
-                    temp_brain = "temp_session_brain.brain"
-                    temp_chat = "temp_session_chat.json"
-
-                    save_res = self.brain.save_snapshot(
-                        temp_brain
-                    )
-
-                    if "Success" not in save_res:
-                        raise Exception(save_res)
-
-                    with open(
-                        temp_chat,
-                        "w",
-                        encoding="utf-8"
-                    ) as f:
-
-                        json.dump(
-                            self.extra,
-                            f,
-                            indent=2
-                        )
-
-                    with zipfile.ZipFile(
-                        self.data,
-                        "w",
-                        zipfile.ZIP_DEFLATED
-                    ) as zf:
-
-                        zf.write(temp_brain)
-                        zf.write(temp_chat)
-
+                    with tempfile.TemporaryDirectory(prefix="codechat_session_") as td:
+                        temp_brain = os.path.join(td, "session.brain")
+                        temp_chat = os.path.join(td, "session.json")
+                        save_res = self.brain.save_snapshot(temp_brain)
+                        if "Success" not in save_res:
+                            raise Exception(save_res)
+                        with open(temp_chat, "w", encoding="utf-8") as f:
+                            json.dump(self.extra, f, indent=2)
+                        with zipfile.ZipFile(self.data, "w", zipfile.ZIP_DEFLATED) as zf:
+                            zf.write(temp_brain, "temp_session_brain.brain")
+                            zf.write(temp_chat, "temp_session_chat.json")
                     res = "Success"
-
                 except Exception as e:
-
                     res = f"Error saving session: {e}"
 
-                finally:
-
-                    if os.path.exists(
-                        "temp_session_brain.brain"
-                    ):
-                        os.remove(
-                            "temp_session_brain.brain"
-                        )
-
-                    if os.path.exists(
-                        "temp_session_chat.json"
-                    ):
-                        os.remove(
-                            "temp_session_chat.json"
-                        )
-
             elif self.task == "load_session":
-
                 try:
+                    with tempfile.TemporaryDirectory(prefix="codechat_session_load_") as td:
+                        with zipfile.ZipFile(self.data, "r") as zf:
+                            names = set(zf.namelist())
+                            if "temp_session_brain.brain" not in names:
+                                raise Exception("Session does not contain a Brain.")
+                            zf.extract("temp_session_brain.brain", td)
+                            if "temp_session_chat.json" in names:
+                                zf.extract("temp_session_chat.json", td)
 
-                    with zipfile.ZipFile(
-                        self.data,
-                        "r"
-                    ) as zf:
-
-                        zf.extractall(
-                            "temp_session_extract"
-                        )
-
-                    if os.path.exists(
-                        "temp_session_extract/temp_session_brain.brain"
-                    ):
-
-                        load_res = self.brain.load_snapshot(
-                            "temp_session_extract/temp_session_brain.brain"
-                        )
-
+                        brain_path = os.path.join(td, "temp_session_brain.brain")
+                        load_res = self.brain.load_snapshot(brain_path)
                         if "Success" not in load_res:
                             raise Exception(load_res)
 
-                    chat_data = []
-
-                    if os.path.exists(
-                        "temp_session_extract/temp_session_chat.json"
-                    ):
-
-                        with open(
-                            "temp_session_extract/temp_session_chat.json",
-                            "r",
-                            encoding="utf-8"
-                        ) as f:
-
-                            chat_data = json.load(f)
-
-                    res = chat_data
-
+                        chat_data = []
+                        chat_path = os.path.join(td, "temp_session_chat.json")
+                        if os.path.exists(chat_path):
+                            with open(chat_path, "r", encoding="utf-8") as f:
+                                chat_data = json.load(f)
+                        res = chat_data
                 except Exception as e:
-
                     res = f"Error loading session: {e}"
-
-                finally:
-
-                    if os.path.exists(
-                        "temp_session_extract"
-                    ):
-
-                        shutil.rmtree(
-                            "temp_session_extract"
-                        )
 
             elif self.task == "query":
 
@@ -531,7 +426,8 @@ class TaskWorker(QThread):
 
                 else:
 
-                    temp_file = "temp_sync.brain"
+                    fd, temp_file = tempfile.mkstemp(prefix="codechat_sync_", suffix=".brain")
+                    os.close(fd)
 
                     save_res = self.brain.save_snapshot(
                         temp_file
@@ -634,6 +530,131 @@ class TaskWorker(QThread):
             self.result_signal.emit(
                 f"CRITICAL ERROR: {str(e)}"
             )
+
+
+class ChatJobSignals(QObject):
+    result = pyqtSignal(object)
+    error = pyqtSignal(str)
+    finished = pyqtSignal(object)
+
+
+class ChatJob(QRunnable):
+    """Non-QThread chat network job. QRunnable is owned by QThreadPool, so
+    pressing Send can never orphan/destroy a QThread wrapper while running."""
+    def __init__(self, brain, text, conversation_id, local_token):
+        super().__init__()
+        self.setAutoDelete(True)
+        self.brain = brain
+        self.text = text
+        self.conversation_id = conversation_id
+        self.local_token = local_token
+        self.signals = ChatJobSignals()
+
+    def run(self):
+        try:
+            if getattr(self.brain, "url", None) and getattr(self.brain, "token", None):
+                url = f"{self.brain.url.rstrip('/')}/chat/messages"
+                headers = dict(getattr(self.brain, "headers", {}) or {})
+                token = self.brain.token
+            else:
+                url = "http://127.0.0.1:8000/chat/messages"
+                headers = {"x-access-token": self.local_token or ""}
+            response = requests.post(
+                url,
+                json={"text": self.text, "conversation_id": self.conversation_id},
+                headers=headers,
+                timeout=120
+            )
+            try:
+                payload = response.json()
+            except Exception:
+                payload = {"error": response.text or f"HTTP {response.status_code}"}
+            if response.status_code != 200:
+                if not payload.get("error"):
+                    detail = payload.get("detail", response.text or "Chat request failed")
+                    payload = {"error": detail}
+                self.signals.error.emit(str(payload.get("error")))
+            else:
+                self.signals.result.emit(payload)
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+        finally:
+            self.signals.finished.emit(self)
+
+
+class TeamPollWorker(QThread):
+    result_signal = pyqtSignal(object)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, brain, conversation_id="team", local_version=0):
+        super().__init__()
+        self.brain = brain
+        self.conversation_id = conversation_id
+        self.local_version = local_version
+
+    def run(self):
+        try:
+            # Never call GUI-only methods on CoreBrain. Host and RemoteBrain use
+            # explicit HTTP paths, eliminating the intermittent CoreBrain API error.
+            if getattr(self.brain, "url", None) and getattr(self.brain, "token", None):
+                # RemoteBrain path only. CoreBrain never exposes/uses get_team_state().
+                state = self.brain.get_team_state()
+                if not state or state.get("auth_error"):
+                    self.result_signal.emit({"brain": self.brain, "auth_error": bool(state and state.get("auth_error"))})
+                    return
+                data = {"brain": self.brain, "state": state}
+                get = lambda path, **kw: requests.get(f"{self.brain.url}{path}", headers=self.brain.headers, timeout=kw.get("timeout", 3), params=kw.get("params"))
+            else:
+                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token or ""}, timeout=1.5)
+                if r.status_code != 200:
+                    self.result_signal.emit({"brain": self.brain, "offline": True})
+                    return
+                state = r.json()
+                data = {"brain": self.brain, "state": state}
+                server_version = state.get("brain_version", 0)
+                if server_version != self.local_version and state.get("brain_ready"):
+                    d = requests.get("http://127.0.0.1:8000/download_brain", headers={"x-access-token": host_token or ""}, timeout=15)
+                    if d.status_code == 200:
+                        data["brain_bytes"] = d.content
+                get = lambda path, **kw: requests.get("http://127.0.0.1:8000" + path, headers={"x-access-token": host_token or ""}, timeout=kw.get("timeout", 3), params=kw.get("params"))
+
+            try:
+                a = get("/history/live", timeout=3)
+                if a.status_code == 200:
+                    data["live_history"] = a.json()
+            except Exception as e:
+                print(f"Live history poll warning: {e}")
+            try:
+                a = get("/team_activity", timeout=3)
+                if a.status_code == 200:
+                    data["history"] = a.json().get("history", [])
+            except Exception: pass
+            try:
+                u = get("/active_users", timeout=3)
+                if u.status_code == 200: data["users"] = u.json().get("users", [])
+            except Exception: pass
+            try:
+                c = get("/chat/conversations", timeout=3)
+                if c.status_code == 200: data["conversations"] = c.json()
+            except Exception: pass
+            if state.get("chat_enabled") and self.conversation_id:
+                try:
+                    m = get("/chat/messages", timeout=3, params={"conversation_id": self.conversation_id})
+                    if m.status_code == 200:
+                        # Tag the response with the conversation that was actually
+                        # queried. The user may switch chats while this worker is
+                        # running; never paint an old conversation into the new one.
+                        data["messages"] = m.json().get("messages", [])
+                        data["messages_conversation_id"] = self.conversation_id
+                except Exception: pass
+            try:
+                hs = get("/history/sessions", timeout=3)
+                if hs.status_code == 200: data["history_sessions"] = hs.json().get("sessions", [])
+            except Exception: pass
+
+            self.result_signal.emit(data)
+        except Exception as e:
+            self.error_signal.emit(str(e))
 
 
 # ============================================================
@@ -791,6 +812,12 @@ class CoreApp(QMainWindow):
         self.chat_conversations = []
         self.current_conversation_id = "team"
         self._chat_last_id = {}
+        self._poll_worker = None
+        self._chat_pool = QThreadPool(self)
+        self._chat_pool.setMaxThreadCount(4)
+        self._chat_jobs = set()
+        self._closing = False
+        self._busy = False
 
         self.init_ui()
 
@@ -1142,15 +1169,47 @@ class CoreApp(QMainWindow):
         self.team_chat_widget = QWidget()
         chat_layout = QHBoxLayout(self.team_chat_widget)
         chat_layout.setContentsMargins(8, 8, 8, 8)
+        chat_sidebar = QVBoxLayout()
         self.chat_conversation_list = QListWidget()
         self.chat_conversation_list.setFixedWidth(190)
         self.chat_conversation_list.currentRowChanged.connect(
             self.select_chat_conversation
         )
+        self.btn_delete_chat = QPushButton("🗑 Delete Chat for Me")
+        self.btn_delete_chat.setToolTip(
+            "Clear this conversation from your view. Other participants keep their messages."
+        )
+        self.btn_delete_chat.clicked.connect(self.delete_current_chat)
+        self.btn_leave_group = QPushButton("🚪 Leave Group")
+        self.btn_leave_group.setToolTip("Leave the selected group. Other members keep the group.")
+        self.btn_leave_group.clicked.connect(self.leave_current_group)
+        self.btn_delete_group = QPushButton("🗑 Delete Group")
+        self.btn_delete_group.setToolTip("Delete the selected group for everyone. Only the Host or group creator can do this.")
+        self.btn_delete_group.clicked.connect(self.delete_current_group)
+        chat_sidebar.addWidget(self.chat_conversation_list, 1)
+        chat_sidebar.addWidget(self.btn_delete_chat)
+        chat_sidebar.addWidget(self.btn_leave_group)
+        chat_sidebar.addWidget(self.btn_delete_group)
         self.team_chat_view = QTextBrowser()
-        chat_layout.addWidget(self.chat_conversation_list)
+        chat_layout.addLayout(chat_sidebar)
         chat_layout.addWidget(self.team_chat_view, 1)
         self.tabs.addTab(self.team_chat_widget, "💬 Team Chat")
+
+        # Read-only session history. Current/live session is shared in real time;
+        # older sessions are fetched server-side and filtered to the requesting user.
+        self.history_widget = QWidget()
+        history_layout = QHBoxLayout(self.history_widget)
+        history_layout.setContentsMargins(8, 8, 8, 8)
+        self.history_list = QListWidget()
+        self.history_list.setFixedWidth(230)
+        self.history_list.currentRowChanged.connect(self.select_history_session)
+        self.history_view = QTextBrowser()
+        self.history_view.setReadOnly(True)
+        history_layout.addWidget(self.history_list)
+        history_layout.addWidget(self.history_view, 1)
+        self.tabs.addTab(self.history_widget, "🕘 History")
+        self.history_sessions = []
+        self.selected_history_id = None
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
         center_layout.addWidget(
@@ -1177,7 +1236,9 @@ class CoreApp(QMainWindow):
         self.inp = QLineEdit()
 
         self.inp.setPlaceholderText(
-            "Ask a question..."
+            "Message @team, @person, @group or @ai..."
+            if getattr(self, "tabs", None) is not None and self.tabs.currentIndex() == 2
+            else "Ask a question..."
         )
 
         self.inp.returnPressed.connect(
@@ -1254,6 +1315,7 @@ class CoreApp(QMainWindow):
         u_layout.addWidget(
             self.user_list
         )
+        self.user_list.itemDoubleClicked.connect(self.show_user_details)
 
         main_layout.addWidget(
             self.user_panel
@@ -1309,12 +1371,13 @@ class CoreApp(QMainWindow):
 
         self.brain = CoreBrain()
         self.is_team_client = False
-        self.user_role = "host"
-        self.user_name = "Host"
-        self.user_handle = "host"
-        self.member_id = "host"
+        self.user_role = "local"
+        self.user_name = "Local User"
+        self.user_handle = "local"
+        self.member_id = "local"
+        self.chat_enabled = True
 
-        self.user_badge.setText(" Local Host ")
+        self.user_badge.setText(" Local / Offline ")
         self.user_badge.setStyleSheet(
             f"background-color: {STATUS_LOCAL}; color:white; "
             "border-radius:4px; padding:5px; font-weight:bold;"
@@ -1333,9 +1396,21 @@ class CoreApp(QMainWindow):
 
     def on_tab_changed(self, index):
         if index == 2:
+            self.inp.setPlaceholderText("Message @team, @person, @group or @ai..." if self.chat_enabled else "Team Chat is disabled by Host")
             self.update_chat_controls()
-            self.refresh_chat_conversations()
-            self.refresh_chat_messages()
+            self.poll_updates()
+        elif index == 3:
+            self.inp.setPlaceholderText("History is read-only")
+            self.inp.setEnabled(False)
+            self.btn_send.setEnabled(False)
+            self.poll_updates()
+            self.refresh_selected_history()
+        else:
+            self.inp.setPlaceholderText("Ask a question...")
+            if index == 1:
+                self.poll_updates()
+            if index != 3:
+                self.update_chat_controls()
 
     def update_chat_controls(self):
         # This method can be reached during init_ui before the Team Chat
@@ -1369,6 +1444,23 @@ class CoreApp(QMainWindow):
         tabs = getattr(self, "tabs", None)
         inp = getattr(self, "inp", None)
         btn_send = getattr(self, "btn_send", None)
+        if tabs is not None and tabs.currentIndex() == 2:
+            # Human Team Chat is independent of the Team Brain. A member must
+            # be able to chat even while the Host is still loading/indexing a Brain.
+            if inp is not None:
+                inp.setEnabled(enabled and not getattr(self, "_chat_busy", False))
+                inp.setPlaceholderText("Message @team, @person, @group or @ai..." if enabled else "Team Chat is disabled by Host")
+            if btn_send is not None:
+                btn_send.setEnabled(enabled and not getattr(self, "_chat_busy", False))
+        elif tabs is not None and tabs.currentIndex() == 3:
+            if inp is not None:
+                inp.setEnabled(False)
+                inp.setPlaceholderText("History is read-only")
+            if btn_send is not None:
+                btn_send.setEnabled(False)
+            if btn_send is not None:
+                btn_send.setEnabled(False)
+            return
         if tabs is not None and tabs.currentIndex() == 2:
             if inp is not None:
                 inp.setEnabled(enabled)
@@ -1411,13 +1503,124 @@ class CoreApp(QMainWindow):
             if self.chat_conversation_list.count():
                 self.chat_conversation_list.setCurrentRow(selected)
             self.chat_conversation_list.blockSignals(False)
+            self.update_group_controls()
         except Exception as e:
             print(f"Chat conversation error: {e}")
 
     def select_chat_conversation(self, row):
         if 0 <= row < len(self.chat_conversations):
             self.current_conversation_id = self.chat_conversations[row].get("id", "team")
+            self.update_group_controls()
             self.refresh_chat_messages()
+
+    def update_group_controls(self):
+        conv = next((c for c in self.chat_conversations if c.get("id") == self.current_conversation_id), None) or {}
+        is_group = conv.get("type") == "group"
+        self.btn_leave_group.setEnabled(is_group)
+        self.btn_delete_group.setEnabled(
+            is_group and (self.member_id == "host" or conv.get("created_by") == self.member_id)
+        )
+        self.btn_delete_chat.setEnabled(bool(conv) and not is_group)
+
+    def leave_current_group(self):
+        if self._closing:
+            return
+        conv = next((c for c in self.chat_conversations if c.get("id") == self.current_conversation_id), None) or {}
+        if conv.get("type") != "group":
+            return
+        group_id = conv.get("group_id") or self.current_conversation_id.split(":", 1)[-1]
+        reply = QMessageBox.question(
+            self, "Leave Group",
+            f"Leave '{conv.get('name', 'this group')}'?\n\nYou will no longer receive messages from this group until you are added again.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                result = self.brain.leave_group(group_id)
+            else:
+                r = requests.post(
+                    f"http://127.0.0.1:8000/chat/groups/{group_id}/leave",
+                    headers={"x-access-token": host_token or ""}, timeout=5
+                )
+                result = r.json() if r.status_code == 200 else {"error": r.text}
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            self.current_conversation_id = "team"
+            self.refresh_chat_conversations()
+            self.set_status("Left group")
+        except Exception as e:
+            QMessageBox.warning(self, "Leave Group", str(e))
+
+    def delete_current_group(self):
+        if self._closing:
+            return
+        conv = next((c for c in self.chat_conversations if c.get("id") == self.current_conversation_id), None) or {}
+        if conv.get("type") != "group":
+            return
+        group_id = conv.get("group_id") or self.current_conversation_id.split(":", 1)[-1]
+        reply = QMessageBox.question(
+            self, "Delete Group",
+            f"Permanently delete '{conv.get('name', 'this group')}' for everyone?\n\nAll members will lose access to this group conversation.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                result = self.brain.delete_group(group_id)
+            else:
+                r = requests.delete(
+                    f"http://127.0.0.1:8000/chat/groups/{group_id}",
+                    headers={"x-access-token": host_token or ""}, timeout=5
+                )
+                result = r.json() if r.status_code == 200 else {"error": r.text}
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            self.current_conversation_id = "team"
+            self.refresh_chat_conversations()
+            self.set_status("Group deleted")
+        except Exception as e:
+            QMessageBox.warning(self, "Delete Group", str(e))
+
+    def delete_current_chat(self):
+        if self._closing or not self.chat_enabled:
+            return
+        conversation_id = self.current_conversation_id or "team"
+        conv = next((c for c in self.chat_conversations if c.get("id") == conversation_id), None)
+        name = (conv or {}).get("name", "this conversation")
+        reply = QMessageBox.question(
+            self,
+            "Delete Chat for Me",
+            f"Clear {name} from your chat history?\n\n"
+            "This only deletes your view. Other participants will keep the conversation and messages.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                result = self.brain.delete_chat_conversation(conversation_id)
+            else:
+                r = requests.delete(
+                    f"http://127.0.0.1:8000/chat/conversations/{conversation_id}",
+                    headers={"x-access-token": host_token or ""},
+                    timeout=5
+                )
+                try:
+                    result = r.json()
+                except Exception:
+                    result = {"error": r.text or f"HTTP {r.status_code}"}
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            self.set_status("Chat cleared for you")
+            self.refresh_chat_messages()
+        except Exception as e:
+            QMessageBox.warning(self, "Delete Chat", str(e))
 
     def refresh_chat_messages(self):
         if not self.chat_enabled:
@@ -1466,37 +1669,54 @@ class CoreApp(QMainWindow):
             print(f"Chat message error: {e}")
 
     def send_team_chat(self):
+        if self._closing:
+            return
         text = self.inp.text().strip()
         if not text or not self.chat_enabled:
             return
-        try:
-            if isinstance(self.brain, RemoteBrain):
-                result = self.brain.send_chat_message(
-                    text, self.current_conversation_id
-                )
-            else:
-                r = requests.post(
-                    "http://127.0.0.1:8000/chat/messages",
-                    json={
-                        "text": text,
-                        "conversation_id": self.current_conversation_id
-                    },
-                    headers={"x-access-token": host_token or ""},
-                    timeout=5
-                )
-                result = r.json() if r.status_code == 200 else {"error": r.text}
-            if result.get("error"):
-                QMessageBox.warning(self, "Team Chat", result["error"])
-                return
-            self.inp.clear()
-            self.refresh_chat_messages()
-        except Exception as e:
-            QMessageBox.warning(self, "Team Chat", str(e))
+        conversation_id = self.current_conversation_id or "team"
+        self.inp.clear()
+        self.btn_send.setEnabled(False)
+        self.set_status("Sending message...")
+
+        job = ChatJob(self.brain, text, conversation_id, host_token or "")
+        self._chat_jobs.add(job)
+        job.signals.result.connect(self._chat_send_success)
+        job.signals.error.connect(self._chat_send_error)
+        job.signals.finished.connect(self._chat_job_finished)
+        self._chat_pool.start(job)
+
+    def _chat_send_success(self, result):
+        if self._closing:
+            return
+        self.set_status("Message sent")
+        self.refresh_chat_messages()
+        self.refresh_chat_conversations()
+
+    def _chat_send_error(self, error):
+        if self._closing:
+            return
+        self.set_status("Chat error")
+        QMessageBox.warning(self, "Team Chat", str(error))
+        self.inp.setFocus()
+
+    def _chat_job_finished(self, job):
+        self._chat_jobs.discard(job)
+        if not self._closing:
+            self.update_chat_controls()
 
     def toggle_team_chat(self):
         if isinstance(self.brain, RemoteBrain):
             return
         desired = self.btn_chat_toggle.isChecked()
+        if not self.confirm_change(
+            "Confirm Team Chat Change",
+            "Turn Team Chat " + ("ON" if desired else "OFF") + " for everyone?"
+        ):
+            self.btn_chat_toggle.blockSignals(True)
+            self.btn_chat_toggle.setChecked(self.chat_enabled)
+            self.btn_chat_toggle.blockSignals(False)
+            return
         try:
             r = requests.post(
                 "http://127.0.0.1:8000/chat/settings",
@@ -1523,52 +1743,44 @@ class CoreApp(QMainWindow):
             if isinstance(self.brain, RemoteBrain):
                 data = self.brain.get_chat_conversations()
             else:
-                r = requests.get(
-                    "http://127.0.0.1:8000/chat/conversations",
-                    headers={"x-access-token": host_token or ""},
-                    timeout=2
-                )
+                r = requests.get("http://127.0.0.1:8000/chat/conversations", headers={"x-access-token": host_token or ""}, timeout=3)
                 data = r.json() if r.status_code == 200 else {}
-            members = data.get("members", [])
-            choices = [
-                f"{m.get('name')} (@{m.get('handle')}) [{m.get('member_id')}]"
-                for m in members if m.get("member_id") != self.member_id
-            ]
-            selected_ids = []
-            while choices:
-                choice, ok = QInputDialog.getItem(
-                    self, "Group Members",
-                    "Select a member (Cancel when finished):",
-                    choices, 0, False
-                )
-                if not ok:
-                    break
-                mid = choice.split("[")[-1].rstrip("]")
-                if mid not in selected_ids:
-                    selected_ids.append(mid)
-                choices = [c for c in choices if not c.endswith(f"[{mid}]")]
+            members = [m for m in data.get("members", []) if m.get("member_id") != self.member_id]
+            if not members:
+                QMessageBox.information(self, "Create Group", "There are no other active team members to add yet.")
+                return
 
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Select Group Members")
+            dialog.resize(420, 420)
+            layout = QVBoxLayout(dialog)
+            layout.addWidget(QLabel("Select everyone you want in this group:"))
+            checks = []
+            for m in members:
+                cb = QCheckBox(f"{m.get('name','Unknown')}  @{m.get('handle','')}  ·  {m.get('role','guest').title()}")
+                cb.setProperty("member_id", m.get("member_id"))
+                layout.addWidget(cb)
+                checks.append(cb)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected_ids = [cb.property("member_id") for cb in checks if cb.isChecked()]
+
+            if not self.confirm_change("Confirm Group Creation", f"Create '{name.strip()}' with {len(selected_ids)} selected teammate{'s' if len(selected_ids) != 1 else ''}?"):
+                return
             if isinstance(self.brain, RemoteBrain):
                 result = self.brain.create_group(name, selected_ids)
             else:
-                r = requests.post(
-                    "http://127.0.0.1:8000/chat/groups",
-                    json={"name": name, "member_ids": selected_ids},
-                    headers={"x-access-token": host_token or ""},
-                    timeout=5
-                )
+                r = requests.post("http://127.0.0.1:8000/chat/groups", json={"name": name, "member_ids": selected_ids}, headers={"x-access-token": host_token or ""}, timeout=5)
                 result = r.json() if r.status_code == 200 else {"error": r.text}
-
             if result.get("error"):
-                QMessageBox.warning(self, "Create Group", result["error"])
-                return
+                QMessageBox.warning(self, "Create Group", result["error"]); return
             group = result.get("group", {})
             self.current_conversation_id = f"group:{group.get('group_id')}"
             self.refresh_chat_conversations()
-            QMessageBox.information(
-                self, "Group Created",
-                f"Created {group.get('name')}.\nUse @{group.get('handle')} to route messages."
-            )
+            QMessageBox.information(self, "Group Created", f"Created {group.get('name')}.\nUse @{group.get('handle')} to route messages.")
         except Exception as e:
             QMessageBox.warning(self, "Create Group", str(e))
 
@@ -1642,13 +1854,30 @@ class CoreApp(QMainWindow):
     # --------------------------------------------------------
 
     def toggle_mode(self):
-        # Remote users never control the mode. The Host is the
-        # single source of truth for Single/Append mode.
-        if isinstance(self.brain, RemoteBrain):
+        if isinstance(self.brain, RemoteBrain) or getattr(self, "_busy", False):
             return
 
-        mode = "append" if self.btn_mode.isChecked() else "single"
+        desired = "append" if self.btn_mode.isChecked() else "single"
+        current = self.team_mode
+        if desired == current:
+            return
 
+        warning = (
+            "Switching to Single Mode will permanently reduce the current Team Brain "
+            "to ONLY the latest uploaded file. Older files will be forgotten.\n\nContinue?"
+            if desired == "single"
+            else
+            "Switch to Append Mode? Future uploads will be added to the existing Team Brain."
+        )
+        if not self.confirm_change("Confirm Mode Change", warning):
+            self.btn_mode.blockSignals(True)
+            self.btn_mode.setChecked(current == "append")
+            self.btn_mode.blockSignals(False)
+            return
+
+        self._busy = True
+        self.btn_mode.setEnabled(False)
+        mode = desired
         try:
             response = requests.post(
                 "http://127.0.0.1:8000/set_mode",
@@ -1679,9 +1908,18 @@ class CoreApp(QMainWindow):
                     "border: 1px dashed #444;"
                 )
 
+            self.team_mode = mode
+            self._busy = False
+            self.btn_mode.setEnabled(True)
+            self.poll_updates()
             self.set_status(f"Team Mode: {mode.title()}")
 
         except Exception as e:
+            self._busy = False
+            self.btn_mode.setEnabled(True)
+            self.btn_mode.blockSignals(True)
+            self.btn_mode.setChecked(current == "append")
+            self.btn_mode.blockSignals(False)
             self.set_status("Mode Error")
             QMessageBox.warning(
                 self,
@@ -1707,6 +1945,20 @@ class CoreApp(QMainWindow):
         self.team_brain_ready = ready
         self.team_brain_version = version
         self.team_brain_chunks = chunks
+
+        if hasattr(self.brain, "workspace_context"):
+            try:
+                self.brain.team_mode = mode
+                self.brain.workspace_context.update({
+                    "identity": "CodeChat AI inside CodeChat Pro Team Edition",
+                    "mode": mode,
+                    "admin": state.get("admin", "Host"),
+                    "file_count": state.get("file_count", 0),
+                    "files": state.get("files", []),
+                    "brain_version": version,
+                })
+            except Exception:
+                pass
 
         if isinstance(self.brain, RemoteBrain):
             # Keep the RemoteBrain's local view aligned with the server.
@@ -1776,151 +2028,259 @@ class CoreApp(QMainWindow):
     # --------------------------------------------------------
 
     def poll_updates(self):
+        if getattr(self, "_poll_worker", None) is not None and self._poll_worker.isRunning():
+            return
+        brain_ref = self.brain
+        self._poll_worker = TeamPollWorker(
+            brain_ref,
+            self.current_conversation_id,
+            self.team_brain_version
+        )
+        self._poll_worker.result_signal.connect(self._apply_poll_result)
+        self._poll_worker.error_signal.connect(lambda e: self._set_poll_error(e, brain_ref))
+        self._poll_worker.finished.connect(self._poll_finished)
+        self._poll_worker.start()
 
-        state = self.get_team_state()
-        if state and state.get("auth_error"):
+    def _poll_finished(self):
+        worker = getattr(self, "_poll_worker", None)
+        if worker is not None:
+            worker.deleteLater()
+        self._poll_worker = None
+
+    def _set_poll_error(self, error, brain_ref):
+        if brain_ref is self.brain:
+            print(f"Team polling error: {error}")
+
+    def _apply_poll_result(self, data):
+        brain_ref = data.get("brain")
+        if brain_ref is not self.brain:
+            return
+        if data.get("auth_error"):
             self.handle_team_revoked()
             return
-        if state:
-            self.apply_team_state(state)
+        if data.get("offline"):
+            self.set_status("Team server unavailable — retrying...")
+            return
 
-        history = self.brain.get_team_chat()
-        events = self.brain.get_team_events() if hasattr(self.brain, "get_team_events") else []
+        # If another team member changed the authoritative Brain, refresh the
+        # Host's local copy before allowing another upload/query against it.
+        if data.get("brain_bytes") and isinstance(self.brain, CoreBrain):
+            try:
+                fd, temp_path = tempfile.mkstemp(prefix="codechat_remote_", suffix=".brain")
+                with os.fdopen(fd, "wb") as f:
+                    f.write(data["brain_bytes"])
+                load_res = self.brain.load_snapshot(temp_path)
+                os.remove(temp_path)
+                if "Success" not in load_res:
+                    self.set_status("Team Brain refresh failed")
+                    return
+            except Exception as e:
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+                self.set_status(f"Team Brain refresh failed: {e}")
+                return
 
-        if history or events:
+        state = data.get("state") or {}
+        self.apply_team_state(state)
+        history = data.get("history", [])
+        html_out = ""
+        for h in history:
+            user = html.escape(str(h.get("user", "Unknown")))
+            query = html.escape(str(h.get("query", "")))
+            answer = html.escape(str(h.get("answer", "")))
+            color = "#5865F2" if "HOST" in user.upper() else "#F59E0B"
+            html_out += f"""<div style='margin-bottom:15px;padding:10px;background:#0f0f0f;border-radius:8px;border:1px solid #222;'>
+<div style='color:{color};font-size:10px;font-weight:bold;margin-bottom:5px;'>👤 {user}</div>
+<div style='background:#1a1a1a;padding:8px;border-radius:6px;margin-bottom:5px;color:#ccc;'><b>Q:</b> {query}</div>
+<div style='background:#111;padding:8px;border-radius:6px;color:#aaa;white-space:pre-wrap;'><b style='color:#5865F2;'>AI:</b> {answer}</div></div>"""
+        if self.team_view.toHtml() != html_out:
+            sb = self.team_view.verticalScrollBar(); at_bottom = sb.value() >= sb.maximum() - 20; old = sb.value()
+            self.team_view.setHtml(html_out)
+            sb.setValue(sb.maximum() if at_bottom else min(old, sb.maximum()))
 
-            html = ""
-
-            for h in history:
-
-                color = (
-                    "#5865F2"
-                    if "HOST" in h['user']
-                    else "#F59E0B"
-                )
-
-                html += f"""
-                <div style="margin-bottom: 15px;
-                padding: 10px;
-                background-color: #0f0f0f;
-                border-radius: 8px;
-                border: 1px solid #222;">
-
-                    <div style="
-                    color:{color};
-                    font-size: 10px;
-                    font-weight: bold;
-                    margin-bottom: 5px;">
-                        👤 {h['user']}
-                    </div>
-
-                    <div style="
-                    background-color: #1a1a1a;
-                    padding: 8px;
-                    border-radius: 6px;
-                    margin-bottom: 5px;
-                    border-left: 2px solid {color};">
-
-                        <span style="
-                        color: #ccc;
-                        font-weight: bold;">
-                            Q:
-                        </span>
-
-                        <span style="
-                        color: #fff;
-                        white-space: pre-wrap;">
-                            {h['query']}
-                        </span>
-
-                    </div>
-
-                    <div style="
-                    background-color: #111;
-                    padding: 8px;
-                    border-radius: 6px;
-                    color: #aaa;
-                    font-size: 12px;
-                    white-space: pre-wrap;">
-
-                        <span style="
-                        color: #5865F2;
-                        font-weight: bold;">
-                            AI:
-                        </span>
-
-                        {h['answer']}
-
-                    </div>
-
-                </div>
-                """
-
-            if events:
-                html += """
-                <h3 style="color:#888;margin-top:20px;">📋 Team Audit</h3>
-                """
-                for ev in events:
-                    actor = ev.get("actor", "Unknown")
-                    target = ev.get("target")
-                    etype = ev.get("type", "event").replace("_", " ").title()
-                    details = ev.get("details", {})
-                    suffix = f" → {target}" if target else ""
-                    if details:
-                        compact = ", ".join(f"{k}: {v}" for k, v in details.items() if k != "invite_token_created")
-                        if compact:
-                            suffix += f" ({compact})"
-                    html += f"""
-                    <div style="margin:6px 0;padding:7px;background:#0b0b0b;
-                                border-left:2px solid #444;color:#888;">
-                        <b style="color:#aaa;">{etype}</b>
-                        · {actor}{suffix}
-                        <span style="color:#555;"> · {ev.get('timestamp','')}</span>
-                    </div>
-                    """
-
-            if self.team_view.toHtml() != html:
-
-                sb = self.team_view.verticalScrollBar()
-
-                was_at_bottom = (
-                    sb.value()
-                    >= (sb.maximum() - 20)
-                )
-
-                old_val = sb.value()
-
-                self.team_view.setHtml(html)
-
-                if was_at_bottom:
-                    sb.setValue(sb.maximum())
-
-                else:
-                    sb.setValue(old_val)
-
-        if self.tabs.currentIndex() == 2 and self.chat_enabled:
-            self.refresh_chat_messages()
-
-        if hasattr(
-            self.brain,
-            'get_connected_users'
+        if "conversations" in data:
+            conv_data = data["conversations"] or {}
+            self.chat_enabled = bool(conv_data.get("enabled", self.chat_enabled))
+            self.chat_conversations = conv_data.get("conversations", [])
+            self.update_chat_controls()
+            self._render_chat_conversations()
+        # A poll can finish after the user has switched conversations. Only
+        # render messages if they belong to the conversation currently visible.
+        if (
+            self.tabs.currentIndex() == 2
+            and self.chat_enabled
+            and "messages" in data
+            and data.get("messages_conversation_id") == self.current_conversation_id
         ):
+            self._render_chat_messages(data.get("messages", []))
 
-            users = self.brain.get_connected_users()
+        users = data.get("users", [])
+        self.user_list.clear()
+        from PyQt6.QtWidgets import QListWidgetItem
+        host_item = QListWidgetItem("👤 Host (Admin) · @host")
+        host_item.setData(Qt.ItemDataRole.UserRole, "host")
+        self.user_list.addItem(host_item)
+        for u in users:
+            if u.get("member_id") == "host":
+                continue
+            prefix = "🟢" if u.get("online") else "⚫"
+            role = u.get("role", "guest").title()
+            item = QListWidgetItem(f"{prefix} {u.get('name', 'Unknown')} · @{u.get('handle', '')} · {role}")
+            item.setData(Qt.ItemDataRole.UserRole, u.get("member_id"))
+            self.user_list.addItem(item)
 
-            self.user_list.clear()
+        if "live_history" in data and self.selected_history_id:
+            live_id = data.get("live_history", {}).get("session_id")
+            if live_id == self.selected_history_id:
+                self._render_history_document(data.get("live_history", {}))
 
-            self.user_list.addItem(
-                "👤 Host (Admin)"
+        if "history_sessions" in data:
+            self.history_sessions = data.get("history_sessions", [])
+            if not self.selected_history_id or not any(x.get("session_id") == self.selected_history_id for x in self.history_sessions):
+                live = next((x for x in self.history_sessions if x.get("live")), None)
+                self.selected_history_id = live.get("session_id") if live else (self.history_sessions[0].get("session_id") if self.history_sessions else None)
+            self._render_history_sessions()
+        if self.tabs.currentIndex() == 3:
+            self.refresh_selected_history()
+
+    def show_user_details(self, item):
+        member_id = item.data(Qt.ItemDataRole.UserRole)
+        if not member_id:
+            return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                url = f"{self.brain.url}/members/{member_id}/details"; headers = self.brain.headers
+            else:
+                url = f"http://127.0.0.1:8000/members/{member_id}/details"; headers = {"x-access-token": host_token or ""}
+            r = requests.get(url, headers=headers, timeout=3)
+            if r.status_code != 200:
+                # A member-list race should not make a valid user look missing.
+                # Refresh the authoritative team state once before failing.
+                try:
+                    sr = requests.get(
+                        (f"{self.brain.url}/team_state" if isinstance(self.brain, RemoteBrain) else "http://127.0.0.1:8000/team_state"),
+                        headers=(self.brain.headers if isinstance(self.brain, RemoteBrain) else {"x-access-token": host_token or ""}),
+                        timeout=3
+                    )
+                    if sr.status_code == 200:
+                        member = next((m for m in sr.json().get("members", []) if m.get("member_id") == member_id), None)
+                        if member:
+                            d = member
+                            d["status"] = member.get("status", "active")
+                        else:
+                            raise Exception(r.json().get("detail", r.text))
+                    else:
+                        raise Exception(r.json().get("detail", r.text))
+                except Exception:
+                    raise Exception(r.json().get("detail", r.text))
+            else:
+                d = r.json()
+            groups = d.get("groups", [])
+            group_text = ", ".join(f"{g.get('name')} (@{g.get('handle')})" for g in groups) or "None"
+            online = "🟢 Online" if d.get("online") else "⚫ Offline"
+            details = (
+                f"<h2>{html.escape(str(d.get('name','Unknown')))}</h2>"
+                f"<p><b>Handle:</b> @{html.escape(str(d.get('handle','')))}</p>"
+                f"<p><b>Role:</b> {html.escape(str(d.get('role','')).title())}</p>"
+                f"<p><b>Status:</b> {online}</p>"
+                f"<p><b>Member ID:</b> {html.escape(str(d.get('member_id','')))}</p>"
+                f"<p><b>Invited by:</b> {html.escape(str(d.get('invited_by','Not available')))}</p>"
+                f"<p><b>Invited at:</b> {html.escape(str(d.get('invited_at','Not available')))}</p>"
+                f"<p><b>Joined at:</b> {html.escape(str(d.get('joined_at','Not available')))}</p>"
+                f"<p><b>Groups:</b> {html.escape(group_text)}</p>"
             )
+            if d.get("removed_by"):
+                details += f"<p><b>Removed by:</b> {html.escape(str(d['removed_by']))} · {html.escape(str(d.get('removed_at','')))}</p>"
+            if d.get("left_at"):
+                details += f"<p><b>Left at:</b> {html.escape(str(d['left_at']))}</p>"
+            QMessageBox.information(self, "Member Details", details)
+        except Exception as e:
+            QMessageBox.warning(self, "Member Details", f"Could not load member details.\n\n{e}")
 
-            for u in users:
+    def _render_history_sessions(self):
+        if not hasattr(self, "history_list"): return
+        self.history_list.blockSignals(True)
+        self.history_list.clear()
+        selected = 0
+        for i, item in enumerate(self.history_sessions):
+            label = ("🟢 LIVE · " if item.get("live") else "🕘 ") + item.get("name", item.get("session_id", "History"))
+            if not item.get("live"):
+                label += f"\n{item.get('started_at','')}"
+            self.history_list.addItem(label)
+            if item.get("session_id") == self.selected_history_id: selected = i
+        if self.history_list.count(): self.history_list.setCurrentRow(selected)
+        self.history_list.blockSignals(False)
 
-                prefix = "🟠" if u.get('role') == 'collaborator' else "⚪"
-                self.user_list.addItem(
-                    f"{prefix} {u.get('name', u.get('email', 'Unknown'))} "
-                    f"@{u.get('handle', '')}"
-                )
+    def select_history_session(self, row):
+        if row < 0 or row >= len(self.history_sessions): return
+        self.selected_history_id = self.history_sessions[row].get("session_id")
+        self.refresh_selected_history()
+
+    def refresh_selected_history(self):
+        if not self.selected_history_id or not hasattr(self, "history_view"): return
+        try:
+            if isinstance(self.brain, RemoteBrain):
+                url = f"{self.brain.url}/history/session/{self.selected_history_id}"; headers = self.brain.headers
+            else:
+                url = f"http://127.0.0.1:8000/history/session/{self.selected_history_id}"; headers = {"x-access-token": host_token or ""}
+            r = requests.get(url, headers=headers, timeout=4)
+            if r.status_code != 200: raise Exception(r.json().get("detail", r.text))
+            d = r.json()
+            self._render_history_document(d)
+        except Exception as e:
+            self.history_view.setHtml(f"<h3>History unavailable</h3><p>{html.escape(str(e))}</p>")
+
+    def _render_history_document(self, d):
+        started = str(d.get("started_at", ""))
+        creator = str(d.get("created_by", "Host"))
+        status = "🟢 LIVE SESSION" if d.get("live") else "🕘 ARCHIVED SESSION"
+        out = f"<h2>{status}</h2>"
+        out += f"<h3>Host/session started by: {html.escape(creator)}</h3>"
+        out += f"<p style='color:#888'><b>Started:</b> {html.escape(started)} · <b>Updated:</b> {html.escape(str(d.get('updated_at','')))}</p>"
+        out += f"<p style='color:#666'>Session ID: {html.escape(str(d.get('session_id','History')))}</p>"
+        out += "<h3>👥 Team Activity</h3>"
+        for ev in d.get("events", []):
+            details = ev.get("details", {}) or {}
+            compact = ", ".join(f"{html.escape(str(k))}: {html.escape(str(v))}" for k,v in details.items() if k != "invite_token_created")
+            out += f"<div style='padding:7px;margin:5px 0;border-left:2px solid #5865F2;background:#101419'><b>{html.escape(str(ev.get('type','event')).replace('_',' ').title())}</b> · {html.escape(str(ev.get('actor','Unknown')))}"
+            if ev.get("target"): out += f" → {html.escape(str(ev.get('target')))}"
+            if compact: out += f" <span style='color:#888'>({compact})</span>"
+            out += f" <span style='color:#555'>· {html.escape(str(ev.get('timestamp','')))}</span></div>"
+        out += "<h3>🤖 Public AI / Team Conversations</h3>"
+        for h in d.get("public_ai", []):
+            out += f"<div style='margin:8px 0;padding:9px;background:#11151a'><b>{html.escape(str(h.get('user','Unknown')))}</b> · {html.escape(str(h.get('timestamp','')))}<br><b>Q:</b> {html.escape(str(h.get('query','')))}<br><b style='color:#5865F2'>AI:</b> {html.escape(str(h.get('answer','')))}</div>"
+        out += "<h3>💬 Chat History</h3>"
+        for m in d.get("chat_messages", []):
+            cid = html.escape(str(m.get('conversation_id','')))
+            out += f"<div style='padding:7px;margin:4px 0;background:#0f1318'><b>{html.escape(str(m.get('sender','Unknown')))}</b> <span style='color:#777'>[{cid}] · {html.escape(str(m.get('timestamp','')))}</span><br>{html.escape(str(m.get('message','')))}</div>"
+        if not d.get("events") and not d.get("public_ai") and not d.get("chat_messages"):
+            out += "<p style='color:#888'>No recorded activity in this session.</p>"
+        self.history_view.setHtml(out)
+
+    def _render_chat_conversations(self):
+        if not hasattr(self, "chat_conversation_list"): return
+        self.chat_conversation_list.blockSignals(True); self.chat_conversation_list.clear()
+        selected = 0
+        for i, conv in enumerate(self.chat_conversations):
+            prefix = {"team":"# ","dm":"👤 ","group":"👥 "}.get(conv.get("type"), "")
+            self.chat_conversation_list.addItem(prefix + conv.get("name", conv.get("id", "Chat")))
+            if conv.get("id") == self.current_conversation_id: selected = i
+        if self.chat_conversation_list.count(): self.chat_conversation_list.setCurrentRow(selected)
+        self.chat_conversation_list.blockSignals(False)
+
+    def _render_chat_messages(self, messages):
+        html_out = ""
+        for m in messages:
+            mine = m.get("sender_id") == self.member_id
+            align = "right" if mine else "left"; bg = "#005c4b" if mine else "#1f1f1f"
+            sender = html.escape(str(m.get("sender", "Unknown"))); handle = html.escape(str(m.get("handle", "")))
+            stamp = html.escape(str(m.get("timestamp", ""))); body = html.escape(str(m.get("message", "")))
+            html_out += f"<div style='text-align:{align};margin:8px 0;'><div style='display:inline-block;background:{bg};padding:10px;border-radius:10px;max-width:75%;'><div style='font-size:10px;color:#888;font-weight:bold;'>{sender} @{handle} · {stamp}</div><div style='color:#eee;margin-top:4px;white-space:pre-wrap;'>{body}</div></div></div>"
+        self.team_chat_view.setHtml(html_out)
+        self.team_chat_view.verticalScrollBar().setValue(self.team_chat_view.verticalScrollBar().maximum())
 
     # --------------------------------------------------------
     # QUESTIONS
@@ -1933,9 +2293,14 @@ class CoreApp(QMainWindow):
         if not t:
             return
 
-        self.handle_question(t)
+        if self.tabs.currentIndex() == 2:
+            self.send_team_chat()
+        else:
+            self.handle_question(t)
 
     def handle_question(self, text):
+        if getattr(self, "_busy", False):
+            return
 
         is_public = (
             self.tabs.currentIndex() == 1
@@ -2022,7 +2387,10 @@ class CoreApp(QMainWindow):
 
             srcs = []
 
+        self._busy = False
         self.set_status("Ready")
+        if self.tabs.currentIndex() != 2 and (not isinstance(self.brain, RemoteBrain) or self.team_brain_ready):
+            self.btn_send.setEnabled(True)
 
         if not isinstance(ans, str):
             ans = str(ans)
@@ -2070,87 +2438,86 @@ class CoreApp(QMainWindow):
                 "Ready"
             )
 
+    def confirm_change(self, title, message):
+        return QMessageBox.question(
+            self, title, message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes
+
     # --------------------------------------------------------
     # INGEST
     # --------------------------------------------------------
 
     def do_ingest(self):
+        if getattr(self, "_busy", False):
+            return
 
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Select Code"
+        is_append = self.team_mode == "append" if isinstance(self.brain, RemoteBrain) else self.btn_mode.isChecked()
+
+        if is_append:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, "Add Files to Project", "", 
+                "Code/Text Files (*.py *.js *.ts *.c *.cpp *.h *.hpp *.java *.md *.txt *.json *.rs *.go)"
+            )
+        else:
+            file, _ = QFileDialog.getOpenFileName(
+                self, "Select Project File", "",
+                "Code/Text Files (*.py *.js *.ts *.c *.cpp *.h *.hpp *.java *.md *.txt *.json *.rs *.go)"
+            )
+            files = [file] if file else []
+
+        if not files:
+            return
+
+        # Single Mode is intentionally destructive: the selected file becomes
+        # the entire Brain. Append Mode adds all selected files.
+        if is_append:
+            action = f"Add {len(files)} file{'s' if len(files) != 1 else ''} to the shared project?"
+        else:
+            action = f"Replace the current Brain with:\n\n{os.path.basename(files[0])}\n\nAll previous project files will be forgotten."
+
+        if not self.confirm_change("Confirm Project Change", action):
+            return
+
+        self._busy = True
+        self.btn_new.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        self.btn_mode.setEnabled(False)
+        self.set_status("Indexing...")
+
+        self.worker = TaskWorker(
+            self.brain,
+            "ingest",
+            files,
+            is_append,
+            extra="publish_team" if isinstance(self.brain, CoreBrain) else None
         )
-
-        if folder:
-
-            # The Host controls the mode. Remote clients merely send
-            # the upload; the server decides whether it is Single or Append.
-            is_append = self.btn_mode.isChecked()
-            if isinstance(self.brain, RemoteBrain):
-                is_append = getattr(
-                    self.brain,
-                    "team_mode",
-                    self.team_mode
-                ) == "append"
-
-            if not is_append:
-
-                self.chat.clear()
-                self.chat_history_log = []
-
-            self.set_status(
-                "Indexing..."
-            )
-
-            self.worker = TaskWorker(
-                self.brain,
-                "ingest",
-                folder,
-                is_append
-            )
-
-            self.worker.msg_signal.connect(
-                lambda s: self.set_status(s)
-            )
-
-            self.worker.result_signal.connect(
-                self.finish_ingest
-            )
-
-            self.worker.start()
+        self.worker.msg_signal.connect(self.set_status)
+        self.worker.result_signal.connect(self.finish_ingest)
+        self.worker.start()
 
     def finish_ingest(self, res):
-        if "Success" in res or "Indexed" in res or "Uploaded Successfully" in res:
-            self.set_status("Ready")
-            self.unlock_ui()
-            self.add_msg(f"✅ {res}", "ai")
+        if "Success" not in str(res) and "Indexed" not in str(res) and "uploaded successfully" not in str(res).lower():
+            self._busy = False
+            self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
+            self.set_status("Upload Failed")
+            QMessageBox.warning(self, "Project Update Failed", str(res))
+            return
 
-            if not isinstance(self.brain, RemoteBrain):
-                self.btn_save_brain.setEnabled(True)
-
-                # Host uploads are immediately published to the central
-                # Team Brain. No collaborator needs to press Sync Server.
-                self.set_status("Publishing Team Brain...")
-                self.sync_worker = TaskWorker(
-                    self.brain,
-                    "sync_server"
-                )
-                self.sync_worker.result_signal.connect(
-                    self.finish_ingest_sync
-                )
-                self.sync_worker.start()
-            else:
-                # Collaborator upload is already ingested by the central
-                # server. Refresh state immediately.
-                self.refresh_team_state_once()
-        else:
-            self.add_msg(f"❌ {res}", "ai")
-            self.set_status("Error")
+        self._busy = False
+        self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
+        self.set_status("Ready")
+        self.unlock_ui()
+        self.add_msg(f"✅ {res}", "ai")
+        self.poll_updates()
 
     def finish_ingest_sync(self, res):
+        self._busy = False
+        self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
         if "SUCCESS" in res:
             self.set_status("Ready")
-            self.refresh_team_state_once()
+            self.poll_updates()
         else:
             self.set_status("Sync Error")
             QMessageBox.warning(
@@ -2160,19 +2527,23 @@ class CoreApp(QMainWindow):
             )
 
     def refresh_team_state_once(self):
-        state = self.get_team_state()
-        if state:
-            self.apply_team_state(state)
+        self.poll_updates()
 
     # --------------------------------------------------------
     # SYNC
     # --------------------------------------------------------
 
     def do_sync(self):
+        if getattr(self, "_busy", False):
+            return
+        if not self.confirm_change(
+            "Confirm Team Sync",
+            "Publish the current local Brain to the Team Server and replace the shared Team Brain?"
+        ):
+            return
 
-        self.set_status(
-            "Syncing..."
-        )
+        self._busy = True
+        self.set_status("Syncing...")
 
         self.worker = TaskWorker(
             self.brain,
@@ -2186,6 +2557,7 @@ class CoreApp(QMainWindow):
         self.worker.start()
 
     def finish_sync(self, res):
+        self._busy = False
 
         if "SUCCESS" in res:
 
@@ -2223,6 +2595,11 @@ class CoreApp(QMainWindow):
         name, role = dlg.get_data()
         if not name.strip():
             return
+        if not self.confirm_change(
+            "Confirm Invitation",
+            f"Invite {name.strip()} as {role.title()}?"
+        ):
+            return
 
         self.set_status("Inviting...")
         self.worker = TaskWorker(
@@ -2251,6 +2628,9 @@ class CoreApp(QMainWindow):
     def toggle_join(self):
 
         if self.btn_join.isChecked():
+            if not self.confirm_change("Join Team", "Join this Team? Your account will become an active team member."):
+                self.btn_join.setChecked(False)
+                return
 
             url, ok1 = QInputDialog.getText(
                 self,
@@ -2516,6 +2896,28 @@ class CoreApp(QMainWindow):
 
     def closeEvent(self, event):
 
+        self._closing = True
+        try:
+            self.team_timer.stop()
+        except Exception:
+            pass
+
+        # Wait for all asynchronous chat jobs before Qt destroys the window.
+        try:
+            self._chat_pool.waitForDone(5000)
+        except Exception:
+            pass
+
+        # Team polling is a QThread; stop and join it before destroying the UI.
+        try:
+            poll = getattr(self, "_poll_worker", None)
+            if poll is not None and poll.isRunning():
+                poll.requestInterruption()
+                poll.quit()
+                poll.wait(5000)
+        except Exception:
+            pass
+
         if (
             hasattr(self, 'brain')
             and isinstance(
@@ -2539,8 +2941,23 @@ class CoreApp(QMainWindow):
                 pass
 
         if self.voice_thread:
+            try:
+                self.voice_thread.stop()
+                self.voice_thread.wait(5000)
+            except Exception:
+                pass
 
-            self.voice_thread.stop()
+        # TaskWorkers are also QThreads. Never let the Python wrapper be
+        # destroyed while its native thread is still executing.
+        for attr in ("worker", "sync_worker"):
+            w = getattr(self, attr, None)
+            try:
+                if w is not None and w.isRunning():
+                    w.requestInterruption()
+                    w.quit()
+                    w.wait(5000)
+            except Exception:
+                pass
 
         stop_server()
         stop_ngrok()
@@ -2684,6 +3101,11 @@ class CoreApp(QMainWindow):
         )
 
         if path:
+            if not self.confirm_change(
+                "Confirm Session Load",
+                "Loading this session will replace the current project Brain and chat history. Continue?"
+            ):
+                return
 
             self.set_status(
                 "Loading Session..."
@@ -2803,6 +3225,14 @@ class CoreApp(QMainWindow):
         )
 
         if path:
+            if not self.confirm_change(
+                "Confirm Brain Load",
+                "Loading this Brain will replace the current local project Brain. Continue?"
+            ):
+                return
+            if getattr(self, "_busy", False):
+                return
+            self._busy = True
             self.set_status("Loading Brain...")
             self.worker = TaskWorker(
                 self.brain,
@@ -2829,6 +3259,7 @@ class CoreApp(QMainWindow):
             )
             self.sync_worker.start()
         else:
+            self._busy = False
             self.set_status("Load Failed")
             QMessageBox.critical(
                 self,
@@ -2838,6 +3269,7 @@ class CoreApp(QMainWindow):
 
     def finish_load_brain_sync(self, res):
         if "SUCCESS" in res:
+            self._busy = False
             self.set_status("Team Brain Ready")
             self.unlock_ui()
             self.add_msg(
@@ -2846,6 +3278,7 @@ class CoreApp(QMainWindow):
             )
             self.refresh_team_state_once()
         else:
+            self._busy = False
             self.set_status("Sync Failed")
             QMessageBox.critical(
                 self,
@@ -2880,10 +3313,11 @@ if __name__ == "__main__":
 
     if "--server" in sys.argv:
 
-        from server import app
+        from server import app, initialize_server
         import uvicorn
 
         print("🚀 Starting CodeChat Team Server...")
+        initialize_server()
 
         uvicorn.run(
             app,
@@ -2900,14 +3334,6 @@ if __name__ == "__main__":
     print("=" * 55)
     print("          CODECHAT STARTING")
     print("=" * 55)
-
-    # --------------------------------------------------------
-    # 0. Create this instance's Host authentication token
-    # --------------------------------------------------------
-    # The same token is passed to the child FastAPI process through
-    # CODECHAT_HOST_TOKEN and is required for Host-only endpoints.
-    host_token = secrets.token_hex(32)
-    os.environ["CODECHAT_HOST_TOKEN"] = host_token
 
     # --------------------------------------------------------
     # 1. Setup Ollama
@@ -2944,8 +3370,6 @@ if __name__ == "__main__":
     # 3. Start GUI
     # --------------------------------------------------------
 
-    print("🖥️ Starting CodeChat GUI...")
-
     app = QApplication(
         sys.argv
     )
@@ -2955,6 +3379,9 @@ if __name__ == "__main__":
     window.show()
 
     exit_code = app.exec()
+
+    if getattr(window, "_poll_worker", None) is not None and window._poll_worker.isRunning():
+        window._poll_worker.quit(); window._poll_worker.wait(2000)
 
     # --------------------------------------------------------
     # 4. Cleanup

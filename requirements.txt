@@ -1,11 +1,13 @@
-# CodeChat Pro — Python Dependencies
-
+# CodeChat Pro — Team Edition
+# Python 3.10+
 PyQt6
 fastapi
 uvicorn
 numpy
 requests
 pydantic
+ollama
+markdown
 SpeechRecognition
 PyAudio
-pyngrok
+langchain-text-splitters

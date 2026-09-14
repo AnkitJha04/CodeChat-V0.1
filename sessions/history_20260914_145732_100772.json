@@ -1,0 +1,291 @@
+{
+  "session_id": "history_20260914_145732_100772",
+  "started_at": "2026-09-14T14:57:32",
+  "created_by": "Host",
+  "updated_at": "2026-09-14T15:09:22",
+  "live": false,
+  "participants": [
+    "host",
+    "096af6c8ec564bb0b2063959247fe446"
+  ],
+  "events": [
+    {
+      "type": "session_started",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": null,
+      "details": {
+        "session": "history_20260914_145732_100772",
+        "started_at": "2026-09-14T14:57:32"
+      },
+      "timestamp": "2026-09-14T14:57:32"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "team",
+      "details": {
+        "conversation_id": "team",
+        "cleared_at": "2026-09-14T14:58:20",
+        "last_message_id": "0e6583cb2843490c9e46ed78a983cdab"
+      },
+      "timestamp": "2026-09-14T14:58:20"
+    },
+    {
+      "type": "group_left",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "Robptics",
+      "details": {
+        "group_id": "be6eba410b16"
+      },
+      "timestamp": "2026-09-14T14:58:23"
+    },
+    {
+      "type": "invited",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "Ankit",
+      "details": {
+        "role": "guest",
+        "invite_token_created": true
+      },
+      "timestamp": "2026-09-14T14:58:44"
+    },
+    {
+      "type": "joined",
+      "actor": "Ankit",
+      "session_id": "history_20260914_145732_100772",
+      "target": null,
+      "details": {
+        "member_id": "096af6c8ec564bb0b2063959247fe446",
+        "role": "guest",
+        "invited_by": "Host"
+      },
+      "timestamp": "2026-09-14T14:59:04"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Ankit",
+      "session_id": "history_20260914_145732_100772",
+      "target": "team",
+      "details": {
+        "conversation_id": "team",
+        "cleared_at": "2026-09-14T14:59:28",
+        "last_message_id": "0e6583cb2843490c9e46ed78a983cdab"
+      },
+      "timestamp": "2026-09-14T14:59:28"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "team",
+      "details": {
+        "conversation_id": "team",
+        "cleared_at": "2026-09-14T15:04:02",
+        "last_message_id": "668809d51d9f41c3b740cda2ebf95091"
+      },
+      "timestamp": "2026-09-14T15:04:02"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "details": {
+        "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+        "cleared_at": "2026-09-14T15:04:05",
+        "last_message_id": "0f00fdc443184856809d6ab03a509dfd"
+      },
+      "timestamp": "2026-09-14T15:04:05"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "details": {
+        "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+        "cleared_at": "2026-09-14T15:04:18",
+        "last_message_id": "0f00fdc443184856809d6ab03a509dfd"
+      },
+      "timestamp": "2026-09-14T15:04:18"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "team",
+      "details": {
+        "conversation_id": "team",
+        "cleared_at": "2026-09-14T15:04:21",
+        "last_message_id": "668809d51d9f41c3b740cda2ebf95091"
+      },
+      "timestamp": "2026-09-14T15:04:21"
+    },
+    {
+      "type": "removed",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "Ankit",
+      "details": {
+        "member_id": "096af6c8ec564bb0b2063959247fe446",
+        "role": "guest"
+      },
+      "timestamp": "2026-09-14T15:04:27"
+    },
+    {
+      "type": "chat_deleted_for_me",
+      "actor": "Host",
+      "session_id": "history_20260914_145732_100772",
+      "target": "team",
+      "details": {
+        "conversation_id": "team",
+        "cleared_at": "2026-09-14T15:04:31",
+        "last_message_id": "668809d51d9f41c3b740cda2ebf95091"
+      },
+      "timestamp": "2026-09-14T15:04:31"
+    }
+  ],
+  "public_ai": [],
+  "chat_messages": [
+    {
+      "id": "618ed178edbf45e396e8e2c80ef546d1",
+      "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "096af6c8ec564bb0b2063959247fe446",
+      "sender": "Ankit",
+      "handle": "ankit",
+      "message": "Hey",
+      "timestamp": "2026-09-14T14:59:40",
+      "mentions": []
+    },
+    {
+      "id": "a3c58d0217744ebabac59f52a680efe5",
+      "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "host",
+      "sender": "Host",
+      "handle": "host",
+      "message": "wassup",
+      "timestamp": "2026-09-14T14:59:49",
+      "mentions": []
+    },
+    {
+      "id": "d28582a0811446e5b6870ee339af262f",
+      "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "host",
+      "sender": "Host",
+      "handle": "host",
+      "message": "@ankit nm just having fun",
+      "timestamp": "2026-09-14T15:00:09",
+      "mentions": [
+        "ankit"
+      ]
+    },
+    {
+      "id": "0f00fdc443184856809d6ab03a509dfd",
+      "conversation_id": "dm:096af6c8ec564bb0b2063959247fe446:host",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "096af6c8ec564bb0b2063959247fe446",
+      "sender": "Ankit",
+      "handle": "ankit",
+      "message": "@host that's good",
+      "timestamp": "2026-09-14T15:00:21",
+      "mentions": [
+        "host"
+      ]
+    },
+    {
+      "id": "c9652a087b44441eb94812f96620783f",
+      "conversation_id": "team",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "096af6c8ec564bb0b2063959247fe446",
+      "sender": "Ankit",
+      "handle": "ankit",
+      "message": "@team hello i am a new joinee",
+      "timestamp": "2026-09-14T15:00:34",
+      "mentions": [
+        "team"
+      ]
+    },
+    {
+      "id": "b8a1d54135ff488e9fd7e12324b5f9f3",
+      "conversation_id": "team",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "096af6c8ec564bb0b2063959247fe446",
+      "sender": "Ankit",
+      "handle": "ankit",
+      "message": "@ai i guess we can talk to codechat as well",
+      "timestamp": "2026-09-14T15:01:02",
+      "mentions": [
+        "ai"
+      ]
+    },
+    {
+      "id": "ac29c8c334b74df08bdcf81c17c0d622",
+      "conversation_id": "team",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "codechat-ai",
+      "sender": "CodeChat AI",
+      "handle": "ai",
+      "message": "❌ Retrieval Error: llama runner process has terminated: CUDA error (status code: 500)",
+      "timestamp": "2026-09-14T15:01:02",
+      "mentions": []
+    },
+    {
+      "id": "5174d8f6775e4e878045526d7fa69085",
+      "conversation_id": "team",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "host",
+      "sender": "Host",
+      "handle": "host",
+      "message": "@team @ankit hello",
+      "timestamp": "2026-09-14T15:02:12",
+      "mentions": [
+        "ankit",
+        "team"
+      ]
+    },
+    {
+      "id": "668809d51d9f41c3b740cda2ebf95091",
+      "conversation_id": "team",
+      "session_id": "history_20260914_145732_100772",
+      "sender_id": "096af6c8ec564bb0b2063959247fe446",
+      "sender": "Ankit",
+      "handle": "ankit",
+      "message": "if i message like this then what",
+      "timestamp": "2026-09-14T15:02:39",
+      "mentions": []
+    }
+  ],
+  "groups": {
+    "be6eba410b16": {
+      "group_id": "be6eba410b16",
+      "name": "Robptics",
+      "handle": "robptics",
+      "members": [
+        "0d4e0ae9b5304e2aa7eda46a8834e1ba",
+        "84356ec8eff34d498d28ef2448266a41"
+      ],
+      "created_by": "0d4e0ae9b5304e2aa7eda46a8834e1ba",
+      "created_by_name": "Ankit Jha",
+      "created_at": "2026-09-14T14:35:34"
+    }
+  },
+  "members": [
+    {
+      "member_id": "host",
+      "name": "Host",
+      "handle": "host",
+      "role": "host",
+      "status": "active",
+      "online": true
+    }
+  ],
+  "mode": "single",
+  "brain_version": 1
+}

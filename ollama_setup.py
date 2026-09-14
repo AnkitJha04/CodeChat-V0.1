@@ -10,6 +10,7 @@ OLLAMA_URL = "http://127.0.0.1:11434"
 OLLAMA_INSTALLER_URL = "https://ollama.com/download/OllamaSetup.exe"
 
 REQUIRED_MODEL = "llama3.1"
+CODECHAT_OLLAMA_TIMEOUT = 90
 
 
 def check_ollama_running():
@@ -153,11 +154,17 @@ def start_ollama():
 
     try:
 
+        env = os.environ.copy()
+        # Conservative defaults reduce GPU runner crashes when several CodeChat
+        # operations happen close together. Individual requests can still use GPU.
+        env.setdefault("OLLAMA_NUM_PARALLEL", "1")
+        env.setdefault("OLLAMA_MAX_LOADED_MODELS", "1")
         subprocess.Popen(
             [ollama_path, "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            env=env
         )
 
         return True

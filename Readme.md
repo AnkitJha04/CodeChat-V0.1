@@ -2,7 +2,7 @@
 
 > **Privacy-first local RAG desktop application for secure AI-assisted team collaboration.**
 
-![Version](https://img.shields.io/badge/version-15.0-blue.svg)
+![Version](https://img.shields.io/badge/version-29.0-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)
 ![GUI](https://img.shields.io/badge/GUI-PyQt6-green.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-red.svg)
@@ -24,7 +24,7 @@
 - [Team Brain](#-team-brain)
 - [Team Roles and Permissions](#-team-roles-and-permissions)
 - [Invitation and Membership System](#-invitation-and-membership-system)
-- [Team Audit and Activity](#-team-audit-and-activity)
+- [History and Privacy](#-history-and-privacy)
 - [Team Chat](#-team-chat)
 - [AI Chat vs Team Chat](#-ai-chat-vs-team-chat)
 - [Chat Routing](#-chat-routing)
@@ -53,7 +53,7 @@
 - 👥 Multi-user team collaboration
 - 💬 Human-to-human team communication
 - 🔐 Token-based team authentication
-- 📊 Team activity and audit tracking
+- 📊 Durable team history and activity tracking
 - 🎙️ Voice interaction
 - 🌐 Optional remote collaboration through ngrok
 
@@ -114,8 +114,8 @@ It provides:
 - Member removal
 - Member self-leave
 - Shared Team Brain
-- Team activity
-- Team audit events
+- Live Team Stream (public AI activity only)
+- Read-only durable History tab
 - Human team chat
 - Direct messages
 - Group conversations
@@ -1379,3 +1379,176 @@ Vivekanand Education Society's Institute of Technology (VESIT)
 > **Build locally. Collaborate securely. Keep your knowledge yours.**
 
 **CodeChat Pro — Team Edition** combines local AI, RAG, team collaboration, and human communication into a single desktop workspace.
+
+
+## Stability & Runtime Notes
+
+Version 16 adds safer startup ownership, persistent Host authentication, non-blocking Team polling, atomic Remote Brain uploads, thread-safe server Brain operations, safer Brain snapshot handling, and stronger Qt6-only packaging guidance.
+
+### Recommended Windows build
+
+Keep PyQt5 installed if required by other projects; PyInstaller can exclude it:
+
+```powershell
+pyinstaller --clean --onefile --windowed --name CodeChat --icon=CodeChat.ico --exclude-module PyQt5 --exclude-module PySide2 --exclude-module PySide6 main.py
+```
+
+The packaged application expects Ollama and `llama3.1` to be available through the existing `ollama_setup.py`. `ngrok.exe` should be placed beside `CodeChat.exe` or available on PATH.
+
+
+---
+
+# 🚀 Stability & Brain Rules — v21
+
+## File selection
+
+- **Single Mode:** exactly one file may be selected per update. That file becomes the complete Team Brain.
+- **Append Mode:** one or many files may be selected and are appended atomically.
+- Switching **Append → Single** keeps only the newest uploaded file (all chunks belonging to that file remain) and forgets older files.
+- Every destructive project/mode change asks for explicit confirmation before execution.
+- Failed embedding or server persistence does not intentionally destroy the previous Brain.
+
+## Team synchronization
+
+The Team Server is authoritative for Team Brain state. The Host refreshes its local Brain when the server Brain version changes, preventing a collaborator's upload from silently being overwritten by a stale Host copy.
+
+## `@ai` inside Team Chat
+
+In the **Team Chat** tab:
+
+- `@ai explain this code` asks CodeChat AI without writing to **My Session**.
+- In a DM, `@ai ...` keeps the AI response inside that DM.
+- In a group, `@ai ...` keeps the AI response inside that group.
+- `@team`, `@person`, and `@group` continue to route human messages.
+- CodeChat AI uses the Team Brain and workspace context (files, file count, Team Brain version, Team mode, and administrator information) when available.
+
+This keeps human chat and the private/project AI window separate.
+
+
+---
+
+# 🕘 History, Profiles and Private Chat — v18
+
+Version 18 makes collaboration state durable and separates live communication from historical records.
+
+## 👤 Active User Profiles
+
+Double-click any active user in the right-hand **ACTIVE USERS** panel. Every connected user can inspect the member profile, including:
+
+- Display name and `@handle`
+- Current role
+- Online/offline status
+- Member ID
+- Who invited the member
+- Join timestamp
+- Groups the member belongs to
+- Removal/leave information when applicable
+
+The information is served by the Team Server, so it is consistent for connected users.
+
+## 🕘 History Tab
+
+The live **Team Stream** no longer contains the audit log. A dedicated read-only **🕘 History** tab stores collaboration sessions as:
+
+```text
+history_YYYYMMDD_HHMMSS
+```
+
+Every Team Server startup begins a new history session while retaining previous sessions for later review.
+
+History records include, where visible to the current user:
+
+- Invitations and who invited whom
+- Member joins and timestamps
+- Roles
+- Member removal and self-leave events
+- Brain initialization/updates and mode changes
+- Team Chat messages
+- `@ai` Team Chat messages and AI replies
+- Public Team AI questions and answers
+- Group creation and membership changes
+- Other recorded collaboration activity
+
+Selecting an older session loads that session without modifying it. The History tab is read-only.
+
+## 🔐 Chat Privacy
+
+Team Chat is persisted across server restarts so previous conversations remain available.
+
+- Team/public chat is visible to connected team members.
+- Group chat is visible only to members of that group.
+- Direct/private messages are visible only to their two participants.
+- The Host is **not** a global reader of private DMs between other members.
+- The Host can only see a DM conversation when the Host is actually one of its participants.
+
+This is enforced by the Team Server on both conversation discovery and message/history retrieval.
+
+> The application-level Host cannot use the normal Team UI/API to inspect another member's private DM. The server state file is stored on the Host machine because this is a self-hosted architecture; operating-system/file-system access to that machine is outside the application's permission model.
+
+## 👥 Group Creation
+
+Any connected member who is allowed to create groups can now use a clear multi-select member picker when creating a group. The creator is automatically included, and any active teammates can be selected before confirmation.
+
+## 💾 Durable Team State
+
+The Team Server now persists collaboration metadata under the CodeChat application data directory, including membership metadata, invitations, Team Chat, groups, events and history sessions. Live online presence is intentionally not persisted and is rebuilt from active connections.
+
+# v21 — Live History & CoreBrain Stability Fixes
+
+## Live Team History
+- The **🕘 History** tab is read-only.
+- The current live session is named `history_YYYYMMDD_HHMMSS` and updates in real time for connected members.
+- Live history contains team-wide activity, invitations, joins/leaves/removals, role changes, Team Brain changes, public AI activity and public Team Chat.
+- Private DMs are never included in another member's live/history view.
+
+## Historical Sessions
+- Session files are stored only under the application's project directory in `sessions/`.
+- Each session is stored as `sessions/history_YYYYMMDD_HHMMSS.json`.
+- Selecting an older session changes only the local viewer; it is never broadcast to the team.
+- The server checks that the requesting member participated in the selected session and filters private conversations to that member.
+
+## Member Profiles
+- Double-click an active member in the right-side Active Users panel to open their profile.
+- Profile information includes role, handle, online status, invited-by information, invitation/join timestamps and group membership.
+
+## Team Stream
+- Team Stream is live/public activity only.
+- Administrative audit history is not displayed there; it belongs in the read-only History tab.
+
+## Group Creation
+- Group creation uses a multi-select member picker so the creator can choose any connected teammate(s).
+
+## Stability
+- Team polling never calls `get_team_state()` on `CoreBrain`; CoreBrain and RemoteBrain are handled through separate safe paths.
+
+
+## v21 — Live & Historical Session History
+
+- Every Team Server launch creates a unique `history_YYYYMMDD_HHMMSS_microseconds` session.
+- Session JSON files are stored only under the project-local `sessions/` directory beside the application.
+- The live History view shows a `session_started` entry with the Host and exact start time, then updates as invites, joins, removals, Brain changes, public AI activity, groups, and Team Chat occur.
+- Older sessions are immutable/read-only and selecting one changes only the requesting user's History tab.
+- Private DMs are filtered server-side and never exposed through another user's history view.
+- CoreBrain runtime context is defensively initialized so stale/frozen instances cannot raise `workspace_context` attribute errors.
+
+
+## v21 fixes
+- Live History has a dedicated `/history/live` API and updates without changing a user's archived-session selection.
+- Session history starts with an explicit Host/session-start event and records invite/join/chat activity.
+- Server restores the saved Team Brain during the actual `main.py --server` launch path.
+- Startup rejects/restarts stale CodeChat server versions so an old server cannot shadow the current API.
+- Member details resolve from the authoritative membership table, not only active presence.
+- Team Chat uses the authoritative server conversation/message endpoints for live polling and sending.
+
+
+# v22 — Team Chat Stability Fixes
+
+Version 22 fixes Team Chat transport and QThread lifecycle issues. Human chat is independent of Team Brain readiness. Team, direct-message, @person, @group, @ai, and group creation operations use a dedicated chat worker so network/Ollama latency cannot block or tear down the GUI. All owned QThreads are retained and waited on during shutdown to prevent `QThread: Destroyed while thread is still running`.
+
+### Per-user chat deletion
+- Any member can use **Delete Chat for Me** in Team Chat.
+- This clears the selected conversation from that member's chat/history view only.
+- Other participants keep their messages and conversation.
+- The same conversation remains available for future messages.
+
+- Group controls: members can leave groups; Host/group creator can delete a group for everyone.
