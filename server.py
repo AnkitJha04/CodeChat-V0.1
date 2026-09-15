@@ -788,6 +788,13 @@ def get_team_state(user_data: dict = Depends(get_user)):
         "session_id": CURRENT_SESSION_ID,
         "events": TEAM_EVENTS[-100:],
         "live_history": history_view_for(user_data["member_id"], snapshot_history()),
+        # Explicit authoritative public stream snapshot. This is intentionally
+        # included in the existing team_state response so clients do not need a
+        # second polling request and cannot miss a freshly logged Host answer.
+        "team_stream": [
+            h for h in TEAM_HISTORY
+            if h.get("session_id") == CURRENT_SESSION_ID
+        ][-100:],
         # Consolidated control-plane data: the GUI can refresh most team UI with
         # one request instead of a cascade of polling requests.
         "users": [m for m in public_member_list() if m["member_id"] == "host" or m["online"]],
@@ -1056,15 +1063,29 @@ async def query_brain(q: Query, user_data: dict = Depends(get_user)):
     ans, srcs = await loop.run_in_executor(None, _run_team_ai_query, q.text, token)
 
     if q.public:
-        TEAM_HISTORY.append({
+        # Public AI activity is authoritative server state. Persist it immediately
+        # so every connected client (including remote collaborators) can receive
+        # exactly the same Team Stream entry through /team_state.
+        entry = {
             "user": name,
             "query": q.text,
             "session_id": CURRENT_SESSION_ID,
             "answer": ans,
             "timestamp": now_iso()
-        })
-        if len(TEAM_HISTORY) > 50:
-            TEAM_HISTORY.pop(0)
+        }
+        with STATE_LOCK:
+            duplicate = any(
+                h.get("session_id") == CURRENT_SESSION_ID
+                and h.get("query") == q.text
+                and h.get("answer") == ans
+                and h.get("user") == name
+                for h in TEAM_HISTORY[-20:]
+            )
+            if not duplicate:
+                TEAM_HISTORY.append(entry)
+                if len(TEAM_HISTORY) > 5000:
+                    TEAM_HISTORY.pop(0)
+        record_activity()
 
     return {"answer": ans, "sources": srcs}
 

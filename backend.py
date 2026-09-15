@@ -950,9 +950,14 @@ class RemoteBrain:
 
         callback_fn(f"📤 Preparing {len(files)} file{'s' if len(files) != 1 else ''}...")
         files_data = []
+        # RemoteBrain must use the exact same file-extraction path as CoreBrain.
+        # Previously the remote client called self._read_file(), but RemoteBrain
+        # does not own that method, so collaborator uploads could produce an empty
+        # payload even when the identical file worked for the Host.
+        extractor = CoreBrain()
         for full in files:
             try:
-                extracted = self._read_file(full)
+                extracted = extractor._read_file(full)
                 rel = os.path.basename(full)
                 for text, _src in extracted:
                     if str(text).strip():

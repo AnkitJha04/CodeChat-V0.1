@@ -707,7 +707,10 @@ class TeamPollWorker(QThread):
                 data["conversations"] = state.get("conversations")
                 data["history_sessions"] = state.get("history_sessions", [])
                 data["live_history"] = state.get("live_history", {})
-                data["history"] = state.get("live_history", {}).get("public_ai", [])
+                data["history"] = state.get(
+                    "team_stream",
+                    state.get("live_history", {}).get("public_ai", [])
+                )
                 if state.get("chat_enabled") and self.conversation_id:
                     try:
                         m = requests.get(f"{url}/chat/messages", headers=headers, timeout=(2, 5),
@@ -725,11 +728,37 @@ class TeamPollWorker(QThread):
                     return
                 state = state_resp.json()
                 data = {"brain": self.brain, "state": state}
+                # The Host keeps a local CoreBrain for low-latency queries, but
+                # the server is authoritative for the Team Brain.  When a
+                # collaborator uploads, the server version advances; fetch the
+                # authoritative snapshot so the Host cannot continue querying
+                # an older private Brain.  Preserve the Host's live AI session
+                # history while replacing only the evidence store.
+                if (
+                    isinstance(self.brain, CoreBrain)
+                    and state.get("brain_ready")
+                    and int(state.get("brain_version", 0) or 0) != int(self.local_version or 0)
+                ):
+                    try:
+                        snap = requests.get(
+                            "http://127.0.0.1:8000/download_brain",
+                            headers={"x-access-token": host_token or ""},
+                            timeout=(2, 10)
+                        )
+                        if snap.status_code == 200:
+                            data["brain_bytes"] = snap.content
+                        else:
+                            print(f"Team Brain sync warning: server returned {snap.status_code}")
+                    except Exception as sync_exc:
+                        print(f"Team Brain sync warning: {sync_exc}")
                 data["users"] = state.get("users", [])
                 data["conversations"] = state.get("conversations")
                 data["history_sessions"] = state.get("history_sessions", [])
                 data["live_history"] = state.get("live_history", {})
-                data["history"] = state.get("live_history", {}).get("public_ai", [])
+                data["history"] = state.get(
+                    "team_stream",
+                    state.get("live_history", {}).get("public_ai", [])
+                )
 
             self.result_signal.emit(data)
         except Exception as e:
@@ -2370,8 +2399,14 @@ class CoreApp(QMainWindow):
                 fd, temp_path = tempfile.mkstemp(prefix="codechat_remote_", suffix=".brain")
                 with os.fdopen(fd, "wb") as f:
                     f.write(data["brain_bytes"])
+                preserved_history = list(getattr(self.brain, "local_history", []) or [])
+                preserved_context = dict(getattr(self.brain, "workspace_context", {}) or {})
                 load_res = self.brain.load_snapshot(temp_path)
                 os.remove(temp_path)
+                if "Success" in load_res:
+                    # Brain synchronization must not create/reset an AI session.
+                    self.brain.local_history = preserved_history
+                    self.brain.workspace_context.update(preserved_context)
                 if "Success" not in load_res:
                     self.set_status("Team Brain refresh failed")
                     return
@@ -2640,6 +2675,12 @@ class CoreApp(QMainWindow):
     def handle_question(self, text):
         if getattr(self, "_busy", False):
             return
+
+        # Keep the Host AI input in a deterministic one-request-at-a-time state.
+        # The previous public Team Stream path could leave the send control in a
+        # stale state after its first local query. finish_query() restores it.
+        self._busy = True
+        self.btn_send.setEnabled(False)
 
         is_public = (
             self.tabs.currentIndex() == 1
