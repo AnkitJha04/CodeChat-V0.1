@@ -1241,6 +1241,9 @@ class CoreApp(QMainWindow):
 
         self.team_view = QTextBrowser()
         self.team_view.setOpenExternalLinks(True)
+        # Host public answers are rendered immediately while /host_log is
+        # acknowledged; pending entries are reconciled by the next poll.
+        self._pending_host_stream = []
 
         self.tabs.addTab(
             self.chat,
@@ -2383,7 +2386,36 @@ class CoreApp(QMainWindow):
 
         state = data.get("state") or {}
         self.apply_team_state(state)
-        history = data.get("history", [])
+        history = list(data.get("history", []))
+        # Do not let a poll containing the pre-log server state erase a freshly
+        # answered Host Team Stream entry.
+        if not isinstance(self.brain, RemoteBrain):
+            pending = list(getattr(self, "_pending_host_stream", []))
+            if pending:
+                acknowledged = [
+                    p for p in pending
+                    if any(
+                        str(h.get("query", "")) == p["query"]
+                        and str(h.get("answer", "")) == p["answer"]
+                        for h in history
+                    )
+                ]
+                if acknowledged:
+                    self._pending_host_stream = [
+                        p for p in pending if p not in acknowledged
+                    ]
+                    pending = list(self._pending_host_stream)
+                existing_pairs = {
+                    (str(h.get("query", "")), str(h.get("answer", "")))
+                    for h in history
+                }
+                for p in pending:
+                    if (p["query"], p["answer"]) not in existing_pairs:
+                        history.append({
+                            "user": self.user_name or "Host",
+                            "query": p["query"],
+                            "answer": p["answer"]
+                        })
         html_out = ""
         for h in history:
             user = html.escape(str(h.get("user", "Unknown")))
@@ -2730,6 +2762,12 @@ class CoreApp(QMainWindow):
                 self.team_view.setHtml(existing + entry)
                 sb = self.team_view.verticalScrollBar()
                 sb.setValue(sb.maximum())
+                if not isinstance(self.brain, RemoteBrain):
+                    self._pending_host_stream.append({
+                        "query": str(query_text),
+                        "answer": str(ans)
+                    })
+                    self._pending_host_stream = self._pending_host_stream[-20:]
             except Exception as exc:
                 print(f"Team Stream immediate-render warning: {exc}")
 

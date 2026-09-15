@@ -1202,16 +1202,28 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
 
 @app.post("/host_log")
 def log_host_activity(log: HostLog, user_data: dict = Depends(require_host)):
-    TEAM_HISTORY.append({
+    # This endpoint is the authoritative bridge for Host-local public queries.
+    # Make retries idempotent so a successful retry can never duplicate a
+    # Team Stream entry.
+    entry = {
         "user": member_display(user_data["info"]),
         "query": log.query,
         "session_id": CURRENT_SESSION_ID,
         "answer": log.answer,
         "timestamp": now_iso()
-    })
-
-    if len(TEAM_HISTORY) > 5000:
-        TEAM_HISTORY.pop(0)
+    }
+    with STATE_LOCK:
+        duplicate = any(
+            h.get("session_id") == CURRENT_SESSION_ID
+            and h.get("query") == log.query
+            and h.get("answer") == log.answer
+            and h.get("user") == entry["user"]
+            for h in TEAM_HISTORY[-20:]
+        )
+        if not duplicate:
+            TEAM_HISTORY.append(entry)
+            if len(TEAM_HISTORY) > 5000:
+                TEAM_HISTORY.pop(0)
     record_activity()
 
     return {"status": "logged"}

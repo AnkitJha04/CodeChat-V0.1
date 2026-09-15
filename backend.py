@@ -9,6 +9,7 @@ import json
 import tempfile
 import threading
 import re
+import time
 
 
 def _is_cuda_failure(exc):
@@ -321,6 +322,28 @@ class CoreBrain:
                 callback_fn(f"⚠️ Skipped {os.path.basename(full)}: {e}")
 
         if not files_data:
+            # Keep collaborator uploads aligned with the Host upload path. If a
+            # format has no directly extractable text, send safe file metadata
+            # rather than failing the upload as invalid content.
+            for full in files:
+                try:
+                    name = os.path.basename(full)
+                    size = os.path.getsize(full)
+                    ext = os.path.splitext(full)[1].lower() or "[none]"
+                    files_data.append({
+                        "text": (
+                            "[FILE METADATA]\\n"
+                            f"Filename: {name}\\n"
+                            f"Extension: {ext}\\n"
+                            f"Size: {size} bytes\\n"
+                            "No directly extractable text content was found."
+                        ),
+                        "source": f"RemoteUpload/{name}"
+                    })
+                except Exception:
+                    pass
+
+        if not files_data:
             return "No valid file content found."
 
         callback_fn(f"📤 Publishing {len(files_data)} file{'s' if len(files_data) != 1 else ''} to Team Brain...")
@@ -594,8 +617,22 @@ class CoreBrain:
             active_history.append({'role': 'assistant', 'content': ans})
             
             if is_public:
-                try: requests.post("http://localhost:8000/host_log", json={"query": query, "answer": ans}, timeout=0.5)
-                except: pass
+                # Ensure the locally generated Host answer reaches the public
+                # Team Stream before a polling cycle can replace the local view.
+                host_log_url = "http://localhost:8000/host_log"
+                payload = {"query": query, "answer": ans}
+                for _ in range(3):
+                    try:
+                        log_res = requests.post(
+                            host_log_url,
+                            json=payload,
+                            headers={"x-access-token": os.environ.get("CODECHAT_HOST_TOKEN", "")},
+                            timeout=2.0
+                        )
+                        if log_res.status_code == 200:
+                            break
+                    except Exception:
+                        pass
             
             return ans, srcs
         except Exception as e: return _friendly_ollama_error(e, "AI response"), []
