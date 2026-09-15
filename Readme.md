@@ -2,7 +2,7 @@
 
 > **Privacy-first local RAG desktop application for secure AI-assisted team collaboration.**
 
-![Version](https://img.shields.io/badge/version-35.0-blue.svg)
+![Version](https://img.shields.io/badge/version-42.0-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-yellow.svg)
 ![GUI](https://img.shields.io/badge/GUI-PyQt6-green.svg)
 ![Backend](https://img.shields.io/badge/Backend-FastAPI-red.svg)
@@ -1580,10 +1580,64 @@ Version 22 fixes Team Chat transport and QThread lifecycle issues. Human chat is
 - Collaborators cannot create the first Team Brain; Host initialization is required.
 
 
-### v35 session + mode rule
+### v36 session + mode rule
 - Switching Single/Append mode NEVER starts or refreshes an AI session.
 - The current My AI conversation and Ollama runtime remain alive during a mode switch.
 - A fresh AI/session boundary occurs only when CodeChat is closed and started again.
 - Append → Single keeps only the latest logical file, but does not erase the current conversation.
 - Single → Append changes only the future upload policy; existing Brain content remains unchanged.
 - Every new application launch starts a fresh isolated Ollama server and empty Team Brain unless the user explicitly loads a saved Brain/session.
+
+## v40 Reliability + Remembered Team Login
+
+- Fixed a guest-query HTTP 500 caused by the Brain snapshot query path using local variable names before assignment.
+- Remote queries no longer fail merely because a transient `/team_state` polling request times out; `/query` remains authoritative.
+- Team membership credentials are persisted by the server in the existing CodeChat team-state store, so a returning member can authenticate with their existing credential without a new invite.
+- The GUI remembers previously joined Team Server URLs and member credentials locally. Returning users can select a remembered team from **Team Login**; a new invite is required only for a new server/team or when the team administrator needs to issue a new credential.
+- Host can change any member between **Guest** and **Collaborator** through **Manage Members → Change Member Role**.
+- Role changes are server-authoritative, persisted, audited, and become live on the member's next Team state update without requiring logout or restart.
+- Removed/left members remain recorded historically but cannot authenticate as active members.
+
+
+# v41 Reliability Hardening
+
+- Team AI queries no longer perform a blocking `/team_state` preflight; the authoritative `/query` endpoint decides Brain readiness.
+- Ollama inference is isolated to a single dedicated AI worker to reduce CPU/GIL contention with the FastAPI control plane.
+- Team polling is rate-limited to 5 seconds with guarded, bounded requests to prevent endpoint storms.
+- Existing v40 remembered-team login, live role changes, Brain publishing, session persistence, chat privacy, and mode/session semantics are retained.
+- Server version: 41.0.
+
+
+## v42 Reliability + Universal Uploads
+- Remembered team members can reconnect using their saved member credential; no new invite is required for an existing valid membership.
+- If a remembered server is offline/unreachable, the GUI reports that explicitly. If the credential is revoked, it reports that a new invite is required.
+- Team AI query remains independent of background Team-state polling.
+- Host and collaborator uploads accept all file extensions. Common text/code, PDF, DOCX, XLSX/XLSM and PPTX files are extracted for RAG; unknown binary formats are handled safely without pretending raw binary is text.
+- Switching/uploading files does not reset the active AI session.
+- Server version: 42.0.
+
+
+# v43 Smoothness / Reliability Hardening
+
+- Team polling is consolidated into the authoritative `/team_state` plus only the currently visible chat conversation, reducing repeated network requests and UI jitter.
+- Team state now carries active-user, conversation, live-history and history-session data in one response.
+- Team AI inference is serialized because the isolated Ollama runtime is configured for one active model request; competing inference workers no longer fight over the runner.
+- Team Brain uploads use a dedicated ingestion lock, while embeddings are performed without holding the control-plane Brain lock, so `/team_state`, chat and AI coordination remain responsive during large uploads.
+- Brain updates no longer erase the current AI session.
+- Remote upload no longer performs a redundant post-upload polling request.
+- Local and Team uploads accept all file extensions; common PDF/DOCX/XLSX/XLSM/PPTX and code/text formats are extracted, while unsupported binaries are handled safely.
+- Server version: 43.0.
+
+
+## v44 Saved Login + New Invite Fix
+- New invite tokens are now correctly accepted during Team Login by falling back from `/team/login` to the existing `/check_role` invitation-consumption flow.
+- Remembered member credentials continue to use `/team/login` and do not consume the credential.
+- Users can delete any locally saved Team login from the Team Login picker. Deleting a saved login only removes it from the current computer; it does not remove the member from the Team server.
+- Server/GUI version: 44.0.
+
+## v45 Stream + Rejoin Fix
+- Host questions asked from **Team Stream** now render the Host's answer immediately instead of waiting for the next Team polling cycle.
+- A member who voluntarily **leaves** a Team can rejoin later using the same valid member credential/invite token while the Team Server is online.
+- A member marked **removed/revoked** cannot self-reactivate; a new credential/invite from the Host is required.
+- Offline/unreachable servers still fail the join operation; the client never treats an offline server as a successful login.
+- Server/GUI version: 45.0.

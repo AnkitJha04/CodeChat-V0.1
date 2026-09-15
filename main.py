@@ -47,6 +47,39 @@ ngrok_process = None
 public_url = None
 host_token = None
 
+# Remember team credentials locally so a returning member can sign in by
+# selecting a previously joined team. The server URL + member token are the
+# credential pair; no separate Team ID is required.
+TEAM_LOGIN_FILE = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+    "CodeChat", "teams.json"
+)
+
+def load_saved_teams():
+    try:
+        if os.path.exists(TEAM_LOGIN_FILE):
+            data = json.loads(Path(TEAM_LOGIN_FILE).read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+def save_saved_teams(teams):
+    try:
+        os.makedirs(os.path.dirname(TEAM_LOGIN_FILE), exist_ok=True)
+        tmp = TEAM_LOGIN_FILE + ".tmp"
+        Path(tmp).write_text(json.dumps(teams, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, TEAM_LOGIN_FILE)
+    except Exception as e:
+        print(f"Team login persistence warning: {e}")
+
+def remember_team(url, token, name, role, member_id):
+    teams = load_saved_teams()
+    key = url.rstrip("/").lower()
+    teams = [t for t in teams if str(t.get("url", "")).rstrip("/").lower() != key]
+    teams.insert(0, {"url": url.rstrip("/"), "token": token, "name": name, "role": role, "member_id": member_id})
+    save_saved_teams(teams[:20])
+
 def start_server():
     global server_process, host_token
     data_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "CodeChat")
@@ -109,13 +142,13 @@ def start_server():
     for _ in range(40):
         time.sleep(0.5)
         if server_process.poll() is not None:
-            print("❌ Server process stopped unexpectedly.")
+            print(f"❌ CodeChat server stopped unexpectedly (exit code {server_process.returncode}).")
             server_process = None
             return False
         try:
-            r = requests.get("http://127.0.0.1:8000/health", timeout=1.5)
-            if r.status_code == 200 and str(r.json().get("version", "")) == "35.0":
-                print(f"✅ Fresh CodeChat server started | AI epoch {r.json().get('ai_session_epoch', '?')}")
+            r = requests.get("http://127.0.0.1:8000/health", timeout=2.0)
+            if r.status_code == 200 and str(r.json().get("version", "")) == "45.0":
+                print(f"✅ Fresh CodeChat v43 server started | AI epoch {r.json().get('ai_session_epoch', '?')}")
                 return True
         except requests.RequestException:
             pass
@@ -136,7 +169,7 @@ def start_ngrok():
             time.sleep(0.5)
             if ngrok_process.poll() is not None: break
             try:
-                r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=1.5)
+                r = requests.get("http://127.0.0.1:4040/api/tunnels", timeout=2.0)
                 if r.status_code == 200:
                     for tunnel in r.json().get("tunnels", []):
                         if tunnel.get("proto") == "https":
@@ -333,11 +366,24 @@ class TaskWorker(QThread):
 
             if self.task == "ingest":
 
-                res = self.brain.ingest_codebase(
-                    self.data,
-                    self.msg_signal.emit,
-                    self.append_mode
-                )
+                # HOST TEAM UPLOADS MUST GO THROUGH THE AUTHORITATIVE SERVER.
+                # The previous build passed extra="publish_team" from the GUI,
+                # but TaskWorker ignored it and indexed only the Host's local
+                # CoreBrain. That made the upload appear successful while remote
+                # members still saw an empty/old Team Brain.
+                if (self.extra == "publish_team"
+                        and isinstance(self.brain, CoreBrain)):
+                    res = self.brain.publish_files_to_server(
+                        self.data,
+                        self.msg_signal.emit,
+                        append_mode=self.append_mode
+                    )
+                else:
+                    res = self.brain.ingest_codebase(
+                        self.data,
+                        self.msg_signal.emit,
+                        self.append_mode
+                    )
 
             elif self.task == "save_brain":
 
@@ -568,6 +614,71 @@ class ChatJob(QRunnable):
             self.signals.finished.emit(self)
 
 
+
+class JoinJobSignals(QObject):
+    result = pyqtSignal(object)
+    error = pyqtSignal(str)
+    finished = pyqtSignal(object)
+
+
+class JoinJob(QRunnable):
+    """Authenticate with a new invite token or a remembered member token.
+    A remembered token is sufficient; no new invite is required unless it was
+    revoked/removed or the user is joining a different server."""
+    def __init__(self, url, token):
+        super().__init__()
+        self.setAutoDelete(True)
+        self.url = url.rstrip("/")
+        self.token = token.strip()
+        self.signals = JoinJobSignals()
+
+    def run(self):
+        try:
+            headers = {"x-access-token": self.token}
+            try:
+                login_resp = requests.post(
+                    f"{self.url}/team/login", json={"token": self.token},
+                    headers=headers, timeout=(3, 10)
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Team server is offline or unreachable. Check the server/URL and try again. ({exc})")
+
+            # A token can be either a remembered member credential OR a brand-new
+            # invite. /team/login intentionally accepts only existing members,
+            # while /check_role promotes a pending invite into a member.  The old
+            # flow tried only /team/login, so every NEW invite was incorrectly
+            # reported as an invalid saved login.
+            if login_resp.status_code in (401, 403):
+                try:
+                    invite_resp = requests.get(
+                        f"{self.url}/check_role", headers=headers, timeout=(3, 10)
+                    )
+                except requests.RequestException as exc:
+                    raise RuntimeError(f"Team server is offline or unreachable. ({exc})")
+                if invite_resp.status_code != 200:
+                    raise RuntimeError("This team login/invite is not valid. If this is a new team, verify the Host URL and invite token. If it is a saved team, the member credential may have been removed or revoked.")
+                role_data = invite_resp.json()
+            elif login_resp.status_code != 200:
+                raise RuntimeError(f"Server returned {login_resp.status_code}: {login_resp.text}")
+            else:
+                role_data = login_resp.json()
+            try:
+                state_resp = requests.get(
+                    f"{self.url}/team_state", headers=headers, timeout=(3, 10)
+                )
+            except requests.RequestException as exc:
+                raise RuntimeError(f"Login succeeded, but the Team server went offline while loading Team state. Try again when it is online. ({exc})")
+            if state_resp.status_code in (401, 403):
+                raise RuntimeError("Login credential was rejected by the Team server. A new invite may be required.")
+            if state_resp.status_code != 200:
+                raise RuntimeError(f"Could not read Team state ({state_resp.status_code}): {state_resp.text}")
+            self.signals.result.emit({"url": self.url, "token": self.token, "role": role_data, "state": state_resp.json()})
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+        finally:
+            self.signals.finished.emit(self)
+
+
 class TeamPollWorker(QThread):
     result_signal = pyqtSignal(object)
     error_signal = pyqtSignal(str)
@@ -580,63 +691,45 @@ class TeamPollWorker(QThread):
 
     def run(self):
         try:
-            # Never call GUI-only methods on CoreBrain. Host and RemoteBrain use
-            # explicit HTTP paths, eliminating the intermittent CoreBrain API error.
             if getattr(self.brain, "url", None) and getattr(self.brain, "token", None):
-                # RemoteBrain path only. CoreBrain never exposes/uses get_team_state().
-                state = self.brain.get_team_state()
-                if not state or state.get("auth_error"):
-                    self.result_signal.emit({"brain": self.brain, "auth_error": bool(state and state.get("auth_error"))})
+                url = self.brain.url.rstrip("/")
+                headers = dict(getattr(self.brain, "headers", {}) or {})
+                state_resp = requests.get(f"{url}/team_state", headers=headers, timeout=(2, 5))
+                if state_resp.status_code in (401, 403):
+                    self.result_signal.emit({"brain": self.brain, "auth_error": True})
                     return
-                data = {"brain": self.brain, "state": state}
-                get = lambda path, **kw: requests.get(f"{self.brain.url}{path}", headers=self.brain.headers, timeout=kw.get("timeout", 3), params=kw.get("params"))
-            else:
-                r = requests.get("http://127.0.0.1:8000/team_state", headers={"x-access-token": host_token or ""}, timeout=1.5)
-                if r.status_code != 200:
+                if state_resp.status_code != 200:
                     self.result_signal.emit({"brain": self.brain, "offline": True})
                     return
-                state = r.json()
+                state = state_resp.json()
                 data = {"brain": self.brain, "state": state}
-                server_version = state.get("brain_version", 0)
-                if server_version != self.local_version and state.get("brain_ready"):
-                    d = requests.get("http://127.0.0.1:8000/download_brain", headers={"x-access-token": host_token or ""}, timeout=15)
-                    if d.status_code == 200:
-                        data["brain_bytes"] = d.content
-                get = lambda path, **kw: requests.get("http://127.0.0.1:8000" + path, headers={"x-access-token": host_token or ""}, timeout=kw.get("timeout", 3), params=kw.get("params"))
-
-            try:
-                a = get("/history/live", timeout=3)
-                if a.status_code == 200:
-                    data["live_history"] = a.json()
-            except Exception as e:
-                print(f"Live history poll warning: {e}")
-            try:
-                a = get("/team_activity", timeout=3)
-                if a.status_code == 200:
-                    data["history"] = a.json().get("history", [])
-            except Exception: pass
-            try:
-                u = get("/active_users", timeout=3)
-                if u.status_code == 200: data["users"] = u.json().get("users", [])
-            except Exception: pass
-            try:
-                c = get("/chat/conversations", timeout=3)
-                if c.status_code == 200: data["conversations"] = c.json()
-            except Exception: pass
-            if state.get("chat_enabled") and self.conversation_id:
-                try:
-                    m = get("/chat/messages", timeout=3, params={"conversation_id": self.conversation_id})
-                    if m.status_code == 200:
-                        # Tag the response with the conversation that was actually
-                        # queried. The user may switch chats while this worker is
-                        # running; never paint an old conversation into the new one.
-                        data["messages"] = m.json().get("messages", [])
-                        data["messages_conversation_id"] = self.conversation_id
-                except Exception: pass
-            try:
-                hs = get("/history/sessions", timeout=3)
-                if hs.status_code == 200: data["history_sessions"] = hs.json().get("sessions", [])
-            except Exception: pass
+                data["users"] = state.get("users", [])
+                data["conversations"] = state.get("conversations")
+                data["history_sessions"] = state.get("history_sessions", [])
+                data["live_history"] = state.get("live_history", {})
+                data["history"] = state.get("live_history", {}).get("public_ai", [])
+                if state.get("chat_enabled") and self.conversation_id:
+                    try:
+                        m = requests.get(f"{url}/chat/messages", headers=headers, timeout=(2, 5),
+                                         params={"conversation_id": self.conversation_id})
+                        if m.status_code == 200:
+                            data["messages"] = m.json().get("messages", [])
+                            data["messages_conversation_id"] = self.conversation_id
+                    except Exception:
+                        pass
+            else:
+                state_resp = requests.get("http://127.0.0.1:8000/team_state",
+                                          headers={"x-access-token": host_token or ""}, timeout=(2, 5))
+                if state_resp.status_code != 200:
+                    self.result_signal.emit({"brain": self.brain, "offline": True})
+                    return
+                state = state_resp.json()
+                data = {"brain": self.brain, "state": state}
+                data["users"] = state.get("users", [])
+                data["conversations"] = state.get("conversations")
+                data["history_sessions"] = state.get("history_sessions", [])
+                data["live_history"] = state.get("live_history", {})
+                data["history"] = state.get("live_history", {}).get("public_ai", [])
 
             self.result_signal.emit(data)
         except Exception as e:
@@ -804,6 +897,9 @@ class CoreApp(QMainWindow):
         self._chat_jobs = set()
         self._task_workers = set()
         self._closing = False
+        self._join_in_progress = False
+        self._join_job = None
+        self._poll_generation = 0
         self._busy = False
         self._notified_message_ids = set()
         self._unread_counts = {}
@@ -818,7 +914,7 @@ class CoreApp(QMainWindow):
             self.poll_updates
         )
 
-        self.team_timer.start(2000)
+        self.team_timer.start(5000)
 
     # --------------------------------------------------------
     # UI
@@ -1872,7 +1968,7 @@ class CoreApp(QMainWindow):
         dlg.resize(430, 360)
         dlg.setStyleSheet(PRO_STYLE)
         layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Host has ultimate authority. Select a member to remove:"))
+        layout.addWidget(QLabel("Host has ultimate authority. Select a member to remove or change role:"))
         lst = QListWidget()
         for m in members:
             status = "🟢" if m.get("online") else "⚪"
@@ -1880,10 +1976,35 @@ class CoreApp(QMainWindow):
                 f"{status} {m.get('name')} @{m.get('handle')} [{m.get('role')}]"
             )
         layout.addWidget(lst)
+        change_btn = QPushButton("🔄 Change Member Role")
         remove_btn = QPushButton("❌ Remove Selected")
         close_btn = QPushButton("Close")
+        layout.addWidget(change_btn)
         layout.addWidget(remove_btn)
         layout.addWidget(close_btn)
+
+        def change_selected():
+            row = lst.currentRow()
+            if row < 0:
+                return
+            target = members[row]
+            current_role = target.get("role", "guest")
+            new_role, ok = QInputDialog.getItem(dlg, "Change Member Role", f"Role for {target.get('name') }:", ["guest", "collaborator"], ["guest", "collaborator"].index(current_role) if current_role in ("guest", "collaborator") else 0, False)
+            if not ok or new_role == current_role:
+                return
+            try:
+                r = requests.post(
+                    "http://127.0.0.1:8000/members/change_role",
+                    json={"member_id": target.get("member_id"), "role": new_role},
+                    headers={"x-access-token": host_token or ""}, timeout=5
+                )
+                if r.status_code != 200:
+                    raise Exception(r.text)
+                target["role"] = new_role
+                lst.item(row).setText(f"{'🟢' if target.get('online') else '⚪'} {target.get('name')} @{target.get('handle')} [{new_role}]")
+                self.set_status(f"{target.get('name')} is now {new_role}")
+            except Exception as e:
+                QMessageBox.warning(dlg, "Role Change Failed", str(e))
 
         def remove_selected():
             row = lst.currentRow()
@@ -1909,6 +2030,7 @@ class CoreApp(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(dlg, "Remove Failed", str(e))
 
+        change_btn.clicked.connect(change_selected)
         remove_btn.clicked.connect(remove_selected)
         close_btn.clicked.connect(dlg.accept)
         dlg.exec()
@@ -2040,6 +2162,14 @@ class CoreApp(QMainWindow):
         self.user_handle = state.get("handle", self.user_handle)
         self.member_id = state.get("member_id", self.member_id)
 
+        # Server-authoritative live role update. A Host can promote/demote a
+        # member without requiring logout or restart; the next poll applies it.
+        if isinstance(self.brain, RemoteBrain):
+            role_now = self.user_role
+            self.btn_invite.setEnabled(role_now == "collaborator")
+            self.btn_new.setEnabled(role_now == "collaborator" and not getattr(self, "_busy", False))
+            self.user_badge.setText(" Remote (Collab) " if role_now == "collaborator" else " Remote (Guest) ")
+
         self.team_mode = mode
         self.team_brain_ready = ready
         self.team_brain_version = version
@@ -2127,24 +2257,93 @@ class CoreApp(QMainWindow):
     # --------------------------------------------------------
 
     def poll_updates(self):
-        if getattr(self, "_poll_worker", None) is not None and self._poll_worker.isRunning():
+        """Start exactly one polling QThread.
+
+        During join/leave the poll is stopped first.  A generation number makes
+        late results from an old TeamPollWorker harmless even if Qt delivers a
+        queued signal after the worker has technically finished.
+        """
+        if self._closing or self._join_in_progress:
             return
+        worker = getattr(self, "_poll_worker", None)
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    return
+            except RuntimeError:
+                self._poll_worker = None
+                worker = None
+
         brain_ref = self.brain
-        self._poll_worker = TeamPollWorker(
+        generation = self._poll_generation
+        worker = TeamPollWorker(
             brain_ref,
             self.current_conversation_id,
             self.team_brain_version
         )
-        self._poll_worker.result_signal.connect(self._apply_poll_result)
-        self._poll_worker.error_signal.connect(lambda e: self._set_poll_error(e, brain_ref))
-        self._poll_worker.finished.connect(self._poll_finished)
-        self._poll_worker.start()
+        self._poll_worker = worker
+        worker._codechat_generation = generation
+        worker.result_signal.connect(
+            lambda data, w=worker, g=generation: self._apply_poll_result_guarded(data, w, g)
+        )
+        worker.error_signal.connect(
+            lambda e, b=brain_ref, w=worker, g=generation:
+                self._set_poll_error_guarded(e, b, w, g)
+        )
+        worker.finished.connect(
+            lambda w=worker, g=generation: self._poll_finished(w, g)
+        )
+        worker.start()
 
-    def _poll_finished(self):
-        worker = getattr(self, "_poll_worker", None)
+    def _apply_poll_result_guarded(self, data, worker, generation):
+        if self._closing or generation != self._poll_generation:
+            return
+        if worker is not getattr(self, "_poll_worker", None):
+            return
+        self._apply_poll_result(data)
+
+    def _set_poll_error_guarded(self, error, brain_ref, worker, generation):
+        if self._closing or generation != self._poll_generation:
+            return
+        self._set_poll_error(error, brain_ref)
+
+    def _poll_finished(self, worker=None, generation=None):
+        current = getattr(self, "_poll_worker", None)
+        if worker is not None and current is not worker:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            return
+        if current is worker or worker is None:
+            self._poll_worker = None
         if worker is not None:
-            worker.deleteLater()
-        self._poll_worker = None
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def _stop_poll_worker(self, wait_ms=5000):
+        """Synchronously retire the current poll before changing self.brain."""
+        self._poll_generation += 1
+        poll = getattr(self, "_poll_worker", None)
+        if poll is None:
+            return True
+        try:
+            if poll.isRunning():
+                poll.requestInterruption()
+                poll.quit()
+                if not poll.wait(wait_ms):
+                    # requests inside TeamPollWorker have short connect/read
+                    # timeouts, so this should only be a last-resort diagnostic.
+                    print("⚠️ Team poll did not stop within timeout.")
+                    return False
+        except RuntimeError:
+            pass
+        finally:
+            if getattr(self, "_poll_worker", None) is poll:
+                self._poll_worker = None
+        return True
 
     def _set_poll_error(self, error, brain_ref):
         if brain_ref is self.brain:
@@ -2458,9 +2657,10 @@ class CoreApp(QMainWindow):
         ))
 
         self.worker.result_signal.connect(
-            lambda r: self.finish_query(
+            lambda r, q=text: self.finish_query(
                 r,
-                is_public
+                is_public,
+                q
             )
         )
 
@@ -2469,7 +2669,8 @@ class CoreApp(QMainWindow):
     def finish_query(
         self,
         result,
-        is_public
+        is_public,
+        query_text=""
     ):
 
         if isinstance(
@@ -2510,6 +2711,27 @@ class CoreApp(QMainWindow):
                 "ai",
                 srcs
             )
+        else:
+            # Team Stream is a shared/public AI view.  Host queries are served
+            # locally by CoreBrain, so do not wait for the next 5-second poll
+            # before showing the Host's own answer. The server also records the
+            # same entry via /host_log, and the next poll reconciles the view.
+            try:
+                user_name = html.escape(str(self.user_name or "Host"))
+                safe_query = html.escape(str(query_text))
+                safe_answer = html.escape(str(ans))
+                existing = self.team_view.toHtml()
+                entry = (
+                    f"<div style='margin-bottom:15px;padding:10px;background:#0f0f0f;border-radius:8px;border:1px solid #222;'>"
+                    f"<div style='color:#5865F2;font-size:10px;font-weight:bold;margin-bottom:5px;'>👤 {user_name}</div>"
+                    f"<div style='background:#1a1a1a;padding:8px;border-radius:6px;margin-bottom:5px;color:#ccc;'><b>Q:</b> {safe_query}</div>"
+                    f"<div style='background:#111;padding:8px;border-radius:6px;color:#aaa;white-space:pre-wrap;'><b style='color:#5865F2;'>AI:</b> {safe_answer}</div></div>"
+                )
+                self.team_view.setHtml(existing + entry)
+                sb = self.team_view.verticalScrollBar()
+                sb.setValue(sb.maximum())
+            except Exception as exc:
+                print(f"Team Stream immediate-render warning: {exc}")
 
         if (
             self.voice_thread
@@ -2566,12 +2788,12 @@ class CoreApp(QMainWindow):
         if is_append:
             files, _ = QFileDialog.getOpenFileNames(
                 self, "Add Files to Project", "", 
-                "Code/Text Files (*.py *.js *.ts *.c *.cpp *.h *.hpp *.java *.md *.txt *.json *.rs *.go)"
+                "All Supported Files (*);;All Files (*)"
             )
         else:
             file, _ = QFileDialog.getOpenFileName(
                 self, "Select Project File", "",
-                "Code/Text Files (*.py *.js *.ts *.c *.cpp *.h *.hpp *.java *.md *.txt *.json *.rs *.go)"
+                "All Supported Files (*);;All Files (*)"
             )
             files = [file] if file else []
 
@@ -2615,9 +2837,8 @@ class CoreApp(QMainWindow):
             return
 
         self._busy = False
-        # Brain changes define a new AI context. Do not let questions about an
-        # older file/session leak into the newly indexed project.
-        self.chat_history_log = []
+        # Uploads are not session boundaries. Keep the current AI conversation alive.
+        # Only a fresh application launch starts a new AI session.
         self.btn_new.setEnabled(True)
         self.btn_mode.setEnabled(not isinstance(self.brain, RemoteBrain))
         self.set_status("Ready")
@@ -2739,289 +2960,229 @@ class CoreApp(QMainWindow):
     # --------------------------------------------------------
 
     def toggle_join(self):
-
+        """Join/leave without blocking the GUI or racing Team polling."""
         if self.btn_join.isChecked():
-            if not self.confirm_change("Join Team", "Join this Team? Your account will become an active team member."):
+            if self._join_in_progress or isinstance(self.brain, RemoteBrain):
+                return
+            if not self.confirm_change(
+                "Join Team",
+                "Join this Team? Your account will become an active team member."
+            ):
+                self.btn_join.blockSignals(True)
                 self.btn_join.setChecked(False)
+                self.btn_join.blockSignals(False)
                 return
 
-            url, ok1 = QInputDialog.getText(
-                self,
-                "Join Team",
-                "Host URL:"
-            )
-
-            token, ok2 = QInputDialog.getText(
-                self,
-                "Auth",
-                "Token:"
-            )
-
-            if ok1 and ok2:
-
-                try:
-
-                    response = requests.get(
-                        f"{url.rstrip('/')}/check_role",
-                        headers={
-                            "x-access-token": token
-                        },
-                        timeout=5
-                    )
-
-                    print("JOIN STATUS:", response.status_code)
-                    print("JOIN RESPONSE:", repr(response.text))
-
-                    if response.status_code != 200:
-                        raise Exception(
-                            f"Server returned {response.status_code}: {response.text}"
-                        )
-
-                    role_data = response.json()
-
-                    self.brain = RemoteBrain(
-                        url,
-                        token
-                    )
-                    self.is_team_client = True
-
-                    role = role_data['role']
-                    self.user_role = role
-                    self.user_name = role_data.get("name", "Team Member")
-                    self.user_handle = role_data.get("handle", "")
-                    self.member_id = role_data.get("member_id")
-
-                    # ----------------------------------------
-                    # LOCK MODE
-                    # ----------------------------------------
-                    # The server decides the mode. Never assume Append.
-                    self.btn_mode.setEnabled(False)
-                    self.is_team_client = True
-
-                    team_state_response = requests.get(
-                        f"{url.rstrip('/')}/team_state",
-                        headers={"x-access-token": token},
-                        timeout=5
-                    )
-                    if team_state_response.status_code == 200:
-                        self.apply_team_state(team_state_response.json())
-
-                    # ----------------------------------------
-                    # BUTTON PERMISSIONS
-                    # ----------------------------------------
-
-                    self.btn_load_session = getattr(
-                        self,
-                        'btn_load_chat',
-                        None
-                    )
-
-                    self.btn_save_chat.setEnabled(
-                        True
-                    )
-
-                    self.btn_load_chat.setEnabled(
-                        False
-                    )
-
-                    self.btn_save_brain.setEnabled(
-                        True
-                    )
-
-                    self.btn_load_brain.setEnabled(
-                        False
-                    )
-
-                    if role == "collaborator":
-
-                        self.user_badge.setText(
-                            " Remote (Collab) "
-                        )
-
-                        self.user_badge.setStyleSheet(
-                            f"background-color: "
-                            f"{STATUS_COLLAB}; "
-                            "color: black; "
-                            "border-radius: 4px; "
-                            "padding: 5px; "
-                            "font-weight:bold;"
-                        )
-
-                        self.btn_new.setEnabled(not getattr(self, "_busy", False))
-
-                    else:
-
-                        self.user_badge.setText(
-                            " Remote (Guest) "
-                        )
-
-                        self.user_badge.setStyleSheet(
-                            f"background-color: "
-                            f"{STATUS_GUEST}; "
-                            "color: white; "
-                            "border-radius: 4px; "
-                            "padding: 5px; "
-                            "font-weight:bold;"
-                        )
-
-                        self.btn_new.setEnabled(False)
-
-                    self.btn_join.setText(
-                        "❌ Leave Team"
-                    )
-
-                    self.btn_invite.setEnabled(
-                        role == "collaborator"
-                    )
-                    self.btn_manage_members.setEnabled(False)
-                    self.btn_chat_toggle.setEnabled(False)
-                    self.btn_new_group.setEnabled(True)
-
-                    self.btn_sync.setEnabled(
-                        False
-                    )
-
-                    if self.team_brain_ready and self.team_brain_chunks > 0:
-                        self.unlock_ui()
-                    else:
-                        self.lock_ui()
-                        self.set_status("Waiting for Host Brain...")
-
-                    self.add_msg(
-                        f"Connected as {role.title()}.",
-                        "ai"
-                    )
-
-                except Exception as e:
-
-                    self.add_msg(
-                        f"❌ Connection Failed: {e}",
-                        "ai"
-                    )
-
-                    self.btn_join.setChecked(
-                        False
-                    )
-
+            saved = load_saved_teams()
+            url = token = ""
+            if saved:
+                # Give users explicit control over remembered credentials.
+                # Deleting here only removes the local saved login; it does NOT
+                # remove the member from the Team server.
+                while True:
+                    labels = [f"{t.get('name','Team')}  ·  {t.get('role','guest').title()}  ·  {t.get('url','')}" for t in saved]
+                    labels.append("➕ Join a New Team (Invite)")
+                    labels.append("🗑 Delete a Saved Team Login")
+                    choice, ok = QInputDialog.getItem(self, "Team Login", "Choose a remembered team, join a new server, or delete a saved login:", labels, 0, False)
+                    if not ok:
+                        self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                    idx = labels.index(choice)
+                    if idx < len(saved):
+                        url = saved[idx].get("url", "").strip()
+                        token = saved[idx].get("token", "").strip()
+                        break
+                    if idx == len(saved):
+                        url, ok1 = QInputDialog.getText(self, "New Team", "Host URL:")
+                        if not ok1 or not url.strip():
+                            self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                        token, ok2 = QInputDialog.getText(self, "Invite Login", "Invite token:")
+                        if not ok2 or not token.strip():
+                            self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                        break
+                    # Delete selected saved login.
+                    del_idx, ok_del = QInputDialog.getItem(self, "Delete Saved Login", "Select the saved team login to delete:", [f"{t.get('name','Team')}  ·  {t.get('url','')}" for t in saved], 0, False)
+                    if ok_del:
+                        d_idx = [f"{t.get('name','Team')}  ·  {t.get('url','')}" for t in saved].index(del_idx)
+                        removed = saved.pop(d_idx)
+                        save_saved_teams(saved)
+                        QMessageBox.information(self, "Saved Login Deleted", f"Removed the saved login for {removed.get('name','Team')}.\n\nThis only deletes the credential from this computer; it does not remove you from the Team.")
+                        if not saved:
+                            url, ok1 = QInputDialog.getText(self, "New Team", "Host URL:")
+                            if not ok1 or not url.strip():
+                                self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                            token, ok2 = QInputDialog.getText(self, "Invite Login", "Invite token:")
+                            if not ok2 or not token.strip():
+                                self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                            break
             else:
+                url, ok1 = QInputDialog.getText(self, "New Team", "Host URL:")
+                if not ok1 or not url.strip():
+                    self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
+                token, ok2 = QInputDialog.getText(self, "Invite Login", "Invite token:")
+                if not ok2 or not token.strip():
+                    self.btn_join.blockSignals(True); self.btn_join.setChecked(False); self.btn_join.blockSignals(False); return
 
-                self.btn_join.setChecked(
-                    False
-                )
+            self._join_in_progress = True
+            self._stop_poll_worker()
+            self.btn_join.setEnabled(False)
+            self.set_status("Connecting to Team…")
+            job = JoinJob(url.strip(), token.strip())
+            self._join_job = job
+            job.signals.result.connect(self._finish_join)
+            job.signals.error.connect(self._join_failed)
+            job.signals.finished.connect(lambda j=job: self._join_job_finished(j))
+            self._chat_pool.start(job)
+            return
 
-        else:
-
+        # Leave: stop polling before replacing RemoteBrain with CoreBrain.
+        if self._join_in_progress:
+            return
+        old_brain = self.brain
+        self._stop_poll_worker()
+        if isinstance(old_brain, RemoteBrain):
             try:
-
                 requests.post(
-                    f"{self.brain.url}/leave",
-                    headers={
-                        "x-access-token":
-                        self.brain.token
-                    },
-                    timeout=2
+                    f"{old_brain.url.rstrip('/')}/leave",
+                    headers={"x-access-token": old_brain.token},
+                    timeout=(1, 3)
                 )
+            except Exception as exc:
+                print(f"Leave notification warning: {exc}")
 
-            except:
-                pass
+        self.brain = CoreBrain()
+        self.is_team_client = False
+        self.user_role = "host"
+        self.user_name = "Host"
+        self.user_handle = "host"
+        self.member_id = "host"
+        self.chat_enabled = True
+        self.team_mode = "single"
+        self.team_brain_ready = False
+        self.team_brain_version = 0
+        self.team_brain_chunks = 0
+        self.current_conversation_id = "team"
+        self.chat_conversations = []
 
-            # --------------------------------------------
-            # RESTORE HOST
-            # --------------------------------------------
+        self.user_badge.setText(" Local Host ")
+        self.user_badge.setStyleSheet(
+            f"background-color: {STATUS_LOCAL}; color: white; "
+            "border-radius: 4px; padding: 5px;"
+        )
+        self.btn_mode.setEnabled(True)
+        self.btn_save_chat.setEnabled(True)
+        self.btn_load_chat.setEnabled(True)
+        self.btn_save_brain.setEnabled(True)
+        self.btn_load_brain.setEnabled(True)
+        self.btn_join.setText("🌐 Join Team")
+        self.btn_invite.setEnabled(True)
+        self.btn_manage_members.setEnabled(True)
+        self.btn_chat_toggle.setEnabled(True)
+        self.btn_new_group.setEnabled(True)
+        self.btn_sync.setEnabled(True)
+        self.btn_new.setEnabled(True)
+        self.lock_ui()
+        self.set_status("Local Host")
 
-            self.brain = CoreBrain()
-            self.is_team_client = False
-            self.user_role = "host"
-            self.user_name = "Host"
-            self.user_handle = "host"
-            self.member_id = "host"
-            self.chat_enabled = True
-            self.team_brain_ready = False
-            self.team_brain_version = 0
-            self.team_brain_chunks = 0
+    def _join_job_finished(self, job):
+        if self._join_job is job:
+            self._join_job = None
+        try:
+            job.deleteLater()
+        except Exception:
+            pass
 
-            self.user_badge.setText(
-                " Local Host "
-            )
+    def _join_failed(self, error):
+        self._join_in_progress = False
+        self.btn_join.setEnabled(True)
+        self.btn_join.blockSignals(True)
+        self.btn_join.setChecked(False)
+        self.btn_join.blockSignals(False)
+        self.set_status("Join failed")
+        self.add_msg(f"❌ Connection Failed: {error}", "ai")
 
-            self.user_badge.setStyleSheet(
-                f"background-color: "
-                f"{STATUS_LOCAL}; "
-                "color: white; "
-                "border-radius: 4px; "
-                "padding: 5px;"
-            )
+    def _finish_join(self, payload):
+        if self._closing or not self._join_in_progress:
+            return
+        try:
+            url = payload["url"]
+            token = payload["token"]
+            role_data = payload["role"]
+            state = payload["state"]
 
-            self.btn_mode.setEnabled(
-                True
-            )
+            # The old poll is already stopped. Only now is it safe to swap the
+            # Brain reference used by every future operation.
+            self.brain = RemoteBrain(url, token)
+            self.is_team_client = True
+            self.user_role = role_data.get("role", "guest")
+            self.user_name = role_data.get("name", "Team Member")
+            self.user_handle = role_data.get("handle", "")
+            self.member_id = role_data.get("member_id")
+            remember_team(url, token, self.user_name, self.user_role, self.member_id)
 
-            self.btn_mode.setStyleSheet(
-                "color: #aaa; "
-                "font-style: italic; "
-                "border: 1px dashed #444;"
-            )
+            self.btn_mode.setEnabled(False)
+            self.btn_save_chat.setEnabled(True)
+            self.btn_load_chat.setEnabled(False)
+            self.btn_save_brain.setEnabled(True)
+            self.btn_load_brain.setEnabled(False)
 
-            self.btn_save_chat.setEnabled(
-                True
-            )
+            role = self.user_role
+            if role == "collaborator":
+                self.user_badge.setText(" Remote (Collab) ")
+                self.user_badge.setStyleSheet(
+                    f"background-color: {STATUS_COLLAB}; color: black; "
+                    "border-radius: 4px; padding: 5px; font-weight:bold;"
+                )
+                self.btn_invite.setEnabled(True)
+                self.btn_new.setEnabled(not getattr(self, "_busy", False))
+            else:
+                self.user_badge.setText(" Remote (Guest) ")
+                self.user_badge.setStyleSheet(
+                    f"background-color: {STATUS_GUEST}; color: white; "
+                    "border-radius: 4px; padding: 5px; font-weight:bold;"
+                )
+                self.btn_invite.setEnabled(False)
+                self.btn_new.setEnabled(False)
 
-            self.btn_load_chat.setEnabled(
-                True
-            )
-
-            self.btn_save_brain.setEnabled(
-                True
-            )
-
-            self.btn_load_brain.setEnabled(
-                True
-            )
-
-            self.btn_join.setText(
-                "🌐 Join Team"
-            )
-
-            self.btn_invite.setEnabled(
-                True
-            )
-            self.btn_manage_members.setEnabled(True)
-            self.btn_chat_toggle.setEnabled(True)
+            self.btn_manage_members.setEnabled(False)
+            self.btn_chat_toggle.setEnabled(False)
             self.btn_new_group.setEnabled(True)
+            self.btn_sync.setEnabled(False)
+            self.btn_join.setText("❌ Leave Team")
 
-            self.btn_sync.setEnabled(
-                True
-            )
+            self.apply_team_state(state)
+            self._join_in_progress = False
+            self.btn_join.setEnabled(True)
 
-            self.btn_new.setEnabled(not getattr(self, "_busy", False))
+            if self.team_brain_ready and self.team_brain_chunks > 0:
+                self.unlock_ui()
+                self.set_status(f"Connected as {role.title()}")
+            else:
+                self.lock_ui()
+                self.set_status("Waiting for Host Brain…")
 
-            self.lock_ui()
+            self.add_msg(f"Connected as {role.title()}.", "ai")
+            self.poll_updates()
+        except Exception as exc:
+            self._join_failed(f"Join setup failed: {exc}")
 
     # --------------------------------------------------------
     # CLOSE
     # --------------------------------------------------------
 
     def closeEvent(self, event):
-
         self._closing = True
         try:
             self.team_timer.stop()
         except Exception:
             pass
 
-        # Wait for all asynchronous chat jobs before Qt destroys the window.
+        # Invalidate every in-flight poll before closing widgets.
+        self._stop_poll_worker(wait_ms=5000)
+
+        # QRunnable chat/join jobs do not own QThread wrappers. Waiting here
+        # prevents late signal delivery into a destroyed window.
         try:
             self._chat_pool.waitForDone(5000)
-        except Exception:
-            pass
-
-        # Team polling is a QThread; stop and join it before destroying the UI.
-        try:
-            poll = getattr(self, "_poll_worker", None)
-            if poll is not None and poll.isRunning():
-                poll.requestInterruption()
-                poll.quit()
-                poll.wait(5000)
         except Exception:
             pass
 

@@ -11,3 +11,8 @@ markdown
 SpeechRecognition
 PyAudio
 langchain-text-splitters
+
+PyPDF2
+python-docx
+openpyxl
+python-pptx

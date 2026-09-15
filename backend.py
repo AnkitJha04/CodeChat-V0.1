@@ -108,23 +108,58 @@ class CoreBrain:
             self.source_order = seen
 
     def _read_file(self, file_path):
+        """Safely extract text from common formats; never decode arbitrary binary as UTF-8."""
         try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            if not content.strip(): return []
-            
+            ext = os.path.splitext(file_path)[1].lower()
+            name = os.path.basename(file_path)
+            text_exts = {'.py','.js','.ts','.jsx','.tsx','.c','.cc','.cpp','.h','.hpp','.java','.kt','.kts','.cs','.go','.rs','.rb','.php','.swift','.m','.mm','.sh','.bash','.zsh','.ps1','.sql','.html','.htm','.css','.scss','.sass','.xml','.yaml','.yml','.toml','.ini','.cfg','.conf','.env','.md','.markdown','.txt','.json','.jsonl','.csv','.tsv','.log','.tex','.rst','.graphql','.proto'}
+            content = None
+            if ext in text_exts or ext == '':
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            elif ext == '.pdf':
+                from PyPDF2 import PdfReader
+                content = '\n\n'.join((pg.extract_text() or '') for pg in PdfReader(file_path).pages)
+            elif ext == '.docx':
+                from docx import Document
+                doc=Document(file_path); parts=[p.text for p in doc.paragraphs]
+                parts += [' | '.join(c.text for c in row.cells) for table in doc.tables for row in table.rows]
+                content='\n'.join(parts)
+            elif ext in ('.xlsx','.xlsm'):
+                from openpyxl import load_workbook
+                wb=load_workbook(file_path,read_only=True,data_only=True); parts=[]
+                for ws in wb.worksheets:
+                    parts.append(f'[SHEET: {ws.title}]')
+                    for row in ws.iter_rows(values_only=True):
+                        vals=[str(v) for v in row if v is not None]
+                        if vals: parts.append(' | '.join(vals))
+                content='\n'.join(parts)
+            elif ext == '.pptx':
+                from pptx import Presentation
+                prs=Presentation(file_path); parts=[]
+                for n,slide in enumerate(prs.slides,1):
+                    parts.append(f'[SLIDE {n}]')
+                    for shape in slide.shapes:
+                        if hasattr(shape,'text') and shape.text.strip(): parts.append(shape.text)
+                content='\n'.join(parts)
+            else:
+                raw=open(file_path,'rb').read(5_000_000)
+                printable=re.findall(rb'[ -~]{4,}',raw)
+                strings='\n'.join(x.decode('ascii','ignore') for x in printable[:2000])
+                content=f'[FILE METADATA]\nFilename: {name}\nExtension: {ext or "[none]"}\nSize: {os.path.getsize(file_path)} bytes'
+                if strings.strip(): content += '\n\n[PRINTABLE STRINGS]\n' + strings
+            content=str(content or '').strip()
+            if not content: content=f'[FILE METADATA]\nFilename: {name}\nNo extractable text content found.'
             if HAS_LANGCHAIN:
-                ext = os.path.splitext(file_path)[1]
-                lang_map = {'.py': Language.PYTHON, '.js': Language.JS, '.ts': Language.TS}
-                lang = lang_map.get(ext, Language.PYTHON)
-                splitter = RecursiveCharacterTextSplitter.from_language(
-                    language=lang, chunk_size=1000, chunk_overlap=100
-                )
-                docs = splitter.create_documents([content])
-                return [(d.page_content, file_path) for d in docs]
-            
-            return [(content, file_path)]
-        except: return []
+                if ext in {'.py','.js','.ts'}:
+                    lang_map={'.py':Language.PYTHON,'.js':Language.JS,'.ts':Language.TS}
+                    splitter=RecursiveCharacterTextSplitter.from_language(language=lang_map[ext],chunk_size=1000,chunk_overlap=100)
+                else:
+                    splitter=RecursiveCharacterTextSplitter(chunk_size=1000,chunk_overlap=100)
+                return [(d.page_content,file_path) for d in splitter.create_documents([content])]
+            return [(content,file_path)]
+        except Exception as e:
+            return [(f'[FILE METADATA]\nFilename: {os.path.basename(file_path)}\nExtraction failed safely: {e}',file_path)]
 
     def ingest_codebase(self, paths, callback_fn, append_mode=False):
         """Index one file in Single mode or one/more selected files in Append mode.
@@ -137,10 +172,9 @@ class CoreBrain:
         if not paths:
             return "No valid file selected."
 
-        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
-        files = [x for x in paths if os.path.splitext(x)[1].lower() in valid]
+        files = list(paths)
         if not files:
-            return "No supported files selected."
+            return "No files selected."
 
         callback_fn(f"📖 Reading {len(files)} selected file{'s' if len(files) != 1 else ''}...")
         data = []
@@ -275,16 +309,14 @@ class CoreBrain:
         if isinstance(paths, (str, os.PathLike)):
             paths = [str(paths)]
         paths = [str(x) for x in (paths or []) if os.path.isfile(str(x))]
-        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.h', '.hpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
         files_data = []
         for full in paths:
-            if os.path.splitext(full)[1].lower() not in valid:
-                continue
             try:
-                with open(full, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                if content.strip():
-                    files_data.append({"text": content, "source": f"HostUpload/{os.path.basename(full)}"})
+                extracted = self._read_file(full)
+                rel = os.path.basename(full)
+                for text, _src in extracted:
+                    if str(text).strip():
+                        files_data.append({"text": str(text), "source": f"HostUpload/{rel}"})
             except Exception as e:
                 callback_fn(f"⚠️ Skipped {os.path.basename(full)}: {e}")
 
@@ -409,15 +441,25 @@ class CoreBrain:
 
     def ask_question(self, query, history=None, is_public=False):
         self._ensure_runtime_state()
-        if not self.chunks or len(self.embeddings) == 0: 
+        # Snapshot all mutable Brain data before any Ollama call.  Querying must
+        # never hold the Brain lock while inference is running; otherwise a slow
+        # embedding/chat call can stall Team uploads and server-side coordination.
+        with self._lock:
+            chunks = list(self.chunks)
+            sources = list(self.sources)
+            matrix = np.asarray(self.embeddings, dtype=np.float32).copy()
+            source_order = list(getattr(self, "source_order", []) or [])
+            workspace_context = dict(getattr(self, "workspace_context", {}) or {})
+            team_mode = getattr(self, "team_mode", "single")
+
+        if not chunks or matrix.size == 0:
             return "❌ Brain is empty. Please load code on Host and click Sync.", []
 
         active_history = history if history is not None else self.local_history
 
         try:
             q_vec = np.asarray(_ollama_embeddings_with_fallback(self.embedding_model, query)['embedding'], dtype=np.float32)
-            matrix = np.asarray(self.embeddings, dtype=np.float32)
-            if matrix.ndim != 2 or matrix.shape[0] != len(self.chunks) or matrix.shape[1] != q_vec.shape[0]:
+            if matrix.ndim != 2 or matrix.shape[0] != len(chunks) or matrix.shape[1] != q_vec.shape[0]:
                 return (
                     "⚠️ This Brain was created with a different embedding model and cannot be queried safely in this session. "
                     "Re-index the files or load a compatible Brain.", []
@@ -437,12 +479,12 @@ class CoreBrain:
             file_selector = re.search(r"@file\s+([^\n]+)", query, flags=re.IGNORECASE)
             if file_selector:
                 wanted = file_selector.group(1).strip().strip("`\"")
-                for src in dict.fromkeys(self.sources):
+                for src in dict.fromkeys(sources):
                     if wanted.lower() in {str(src).lower(), os.path.basename(str(src)).lower()}:
                         explicit.append(src)
                 if not explicit:
                     return f"⚠️ I could not find the requested file `{wanted}` in the Team Brain.", []
-            for src in dict.fromkeys(self.sources):
+            for src in dict.fromkeys(sources):
                 base = os.path.basename(str(src))
                 stem = os.path.splitext(base)[0]
                 if len(base) >= 5 and base.lower() in q_lower:
@@ -451,8 +493,8 @@ class CoreBrain:
                     explicit.append(src)
 
             source_scores = {}
-            for src in dict.fromkeys(self.sources):
-                idxs = [i for i, x in enumerate(self.sources) if x == src]
+            for src in dict.fromkeys(sources):
+                idxs = [i for i, x in enumerate(sources) if x == src]
                 vals = sorted((float(sims[i]) for i in idxs), reverse=True)
                 # Best chunk dominates, but the second-best chunk provides a
                 # small confidence bonus so files with one accidental match lose.
@@ -480,13 +522,13 @@ class CoreBrain:
                 if len(candidate_sources) == 2 and source_scores[candidate_sources[1]] < max(0.24, source_scores[candidate_sources[0]] * 0.72):
                     candidate_sources = candidate_sources[:1]
 
-            candidate = [i for i, src in enumerate(self.sources) if src in candidate_sources]
+            candidate = [i for i, src in enumerate(sources) if src in candidate_sources]
             ranked = sorted(candidate, key=lambda i: float(sims[i]), reverse=True)
 
             selected = []
             per_source = {}
             for i in ranked:
-                src = self.sources[i]
+                src = sources[i]
                 limit = 8 if explicit else 5
                 if per_source.get(src, 0) >= limit:
                     continue
@@ -506,12 +548,21 @@ class CoreBrain:
             # supports that relationship.
             ctx_parts = []
             for i in selected:
-                ctx_parts.append(f"[SOURCE: {self.sources[i]} | FILE: {os.path.basename(str(self.sources[i]))}]\n{self.chunks[i]}")
+                ctx_parts.append(f"[SOURCE: {sources[i]} | FILE: {os.path.basename(str(sources[i]))}]\n{self.chunks[i]}")
             ctx = "\n\n---\n\n".join(ctx_parts)
-            srcs = list(dict.fromkeys(str(self.sources[i]) for i in selected))
+            srcs = list(dict.fromkeys(str(sources[i]) for i in selected))
         except Exception as e: return _friendly_ollama_error(e, "Retrieval"), []
 
-        info = self.context_summary()
+        info = {
+            "file_count": len(source_order),
+            "chunk_count": len(chunks),
+            "files": [str(x) for x in source_order if x in set(sources)],
+            "team": workspace_context.get("team", {}),
+        }
+        if not info["files"]:
+            info["files"] = list(dict.fromkeys(str(x) for x in sources))
+        info["file_count"] = len(info["files"])
+        info["chunk_count"] = len(chunks)
         file_list = ", ".join(info["files"]) if info["files"] else "No indexed files"
         system_msg = (
             "You are CodeChat AI, the AI assistant inside CodeChat Pro Team Edition. "
@@ -549,6 +600,26 @@ class CoreBrain:
             return ans, srcs
         except Exception as e: return _friendly_ollama_error(e, "AI response"), []
 
+
+def run_isolated_ai_query(payload):
+    """Run one Team AI query in an isolated worker process.
+
+    The worker receives only a snapshot of the authoritative Brain state, so a
+    stalled Ollama call cannot monopolize the FastAPI control-plane process.
+    """
+    brain = CoreBrain.__new__(CoreBrain)
+    brain.chunks = list(payload.get("chunks", []))
+    brain.sources = list(payload.get("sources", []))
+    brain.embeddings = np.asarray(payload.get("embeddings", []), dtype=np.float32)
+    brain.source_order = list(payload.get("source_order", []))
+    brain.local_history = list(payload.get("history", []))
+    brain.model = payload.get("model", "llama3.1")
+    brain.embedding_model = payload.get("embedding_model", "nomic-embed-text")
+    brain.team_mode = payload.get("team_mode", "single")
+    brain.workspace_context = dict(payload.get("workspace_context", {}) or {})
+    brain._lock = threading.RLock()
+    return brain.ask_question(payload.get("query", ""), history=brain.local_history, is_public=False)
+
 class RemoteBrain:
     def __init__(self, url, token):
         self.url = url.rstrip('/')
@@ -576,9 +647,6 @@ class RemoteBrain:
 
     def ask_question(self, query, history=None, is_public=False):
         try:
-            state = self.get_team_state()
-            if state and not state.get("brain_ready", False):
-                return "🧠 Waiting for the Host to load a Team Brain.", []
             res = requests.post(
                 f"{self.url}/query",
                 json={"text": query, "public": is_public},
@@ -839,20 +907,19 @@ class RemoteBrain:
         if isinstance(paths, (str, os.PathLike)):
             paths = [str(paths)]
         paths = [str(x) for x in (paths or []) if os.path.isfile(str(x))]
-        valid = {'.py', '.js', '.ts', '.c', '.cpp', '.java', '.md', '.txt', '.json', '.rs', '.go'}
-        files = [x for x in paths if os.path.splitext(x)[1].lower() in valid]
+        files = list(paths)
         if not files:
-            return "No supported files selected."
+            return "No files selected."
 
         callback_fn(f"📤 Preparing {len(files)} file{'s' if len(files) != 1 else ''}...")
         files_data = []
         for full in files:
             try:
-                with open(full, 'r', encoding='utf-8', errors='ignore') as fo:
-                    content = fo.read()
-                if content.strip():
-                    rel = os.path.basename(full)
-                    files_data.append({"text": content, "source": f"RemoteUpload/{rel}"})
+                extracted = self._read_file(full)
+                rel = os.path.basename(full)
+                for text, _src in extracted:
+                    if str(text).strip():
+                        files_data.append({"text": str(text), "source": f"RemoteUpload/{rel}"})
             except Exception as e:
                 callback_fn(f"⚠️ Skipped {os.path.basename(full)}: {e}")
 
@@ -869,7 +936,6 @@ class RemoteBrain:
             )
             if res.status_code != 200:
                 return self._error_from_response(res)
-            self.get_team_state()
             return "✅ All selected files uploaded successfully"
         except Exception as e:
             return f"❌ Connection Lost: {e}"

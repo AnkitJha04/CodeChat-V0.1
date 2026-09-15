@@ -1,4 +1,6 @@
 import uvicorn
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.responses import FileResponse
@@ -12,6 +14,7 @@ import base64
 import re
 import uuid
 import threading
+import multiprocessing as mp
 import tempfile
 import json
 import numpy as np
@@ -64,8 +67,18 @@ os.makedirs(APP_DATA_DIR, exist_ok=True)
 SERVER_BRAIN_FILE = os.path.join(APP_DATA_DIR, "server_brain.brain")
 SERVER_STATE_FILE = os.path.join(APP_DATA_DIR, "team_state.json")
 BRAIN_LOCK = threading.RLock()
+# Dedicated inference pool: a slow Ollama request must never consume the
+# FastAPI coordination/control-plane worker handling /team_state, chat, members, etc.
+AI_EXECUTOR = None
+AI_ACTIVE = 0
+AI_ACTIVE_LOCK = threading.Lock()
 STATE_LOCK = threading.RLock()
 SERVER_INIT_LOCK = threading.RLock()
+# Serialize Team AI inference: Ollama is configured for one loaded model/parallel request.
+# This prevents competing worker processes from causing runner churn and latency spikes.
+AI_QUERY_LOCK = threading.Lock()
+# Serialize uploads without blocking fast control-plane reads during embedding.
+INGEST_LOCK = threading.Lock()
 SERVER_INITIALIZED = False
 CURRENT_SESSION_ID = None
 CURRENT_SESSION_STARTED = None
@@ -126,6 +139,16 @@ class GroupMemberRequest(BaseModel):
 
 class RemoveMemberRequest(BaseModel):
     member_id: str
+
+
+class ChangeMemberRoleRequest(BaseModel):
+    member_id: str
+    role: str
+
+
+class TeamLoginRequest(BaseModel):
+    # Login uses the member's existing team credential. No team ID is needed.
+    token: str
 
 
 # ============================================================
@@ -517,7 +540,13 @@ def get_chat_message_view(message):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "35.0", "service": "codechat-team-server", "ai_session_epoch": AI_SESSION_EPOCH}
+    return {
+        "status": "ok",
+        "version": "45.0",
+        "service": "codechat-team-server",
+        "ai_session_epoch": AI_SESSION_EPOCH,
+        "ai_active": AI_ACTIVE,
+    }
 
 
 # ============================================================
@@ -554,6 +583,7 @@ def create_invite(inv: Invite, user_data: dict = Depends(get_user)):
         name,
         {"role": role, "invite_token_created": True}
     )
+    persist_server_state()
 
     return {
         "status": "Invite generated",
@@ -566,7 +596,11 @@ def create_invite(inv: Invite, user_data: dict = Depends(get_user)):
 
 @app.get("/check_role")
 def check_role(x_access_token: str = Header(...)):
-    # An invitation token becomes a member on first successful use.
+    # A pending invite becomes a member on first use.
+    # A member who voluntarily LEFT may use the same credential again to
+    # rejoin. A REMOVED member may never self-rejoin; the Host must issue a
+    # genuinely new invite/credential. This distinction also makes offline
+    # and revoked access fail closed through normal authentication.
     if x_access_token in PENDING_INVITES:
         invite = PENDING_INVITES.pop(x_access_token)
 
@@ -600,6 +634,22 @@ def check_role(x_access_token: str = Header(...)):
                 "invited_by": invite["invited_by_name"]
             }
         )
+        persist_server_state()
+    else:
+        existing = ACCESS_TOKENS.get(x_access_token)
+        if existing and existing.get("status") == "left":
+            # Rejoin with the same original credential after a voluntary leave.
+            existing["status"] = "active"
+            existing["rejoined_at"] = now_iso()
+            existing.pop("left_at", None)
+            USER_SESSIONS.setdefault(x_access_token, [])
+            record_event(
+                "rejoined",
+                member_display(existing),
+                None,
+                {"member_id": existing.get("member_id"), "role": existing.get("role")}
+            )
+            persist_server_state()
 
     user_data = auth_from_token(x_access_token)
     return {
@@ -632,12 +682,53 @@ def remove_member(req: RemoveMemberRequest, user_data: dict = Depends(require_ho
         target_name,
         {"member_id": req.member_id, "role": target.get("role")}
     )
+    persist_server_state()
 
     return {
         "status": "removed",
         "member_id": req.member_id,
         "name": target_name,
         "removed_by": member_display(user_data["info"])
+    }
+
+
+@app.post("/members/change_role")
+def change_member_role(req: ChangeMemberRoleRequest, user_data: dict = Depends(require_host)):
+    target = member_by_id(req.member_id)
+    if not target or req.member_id == "host":
+        raise HTTPException(status_code=404, detail="Team member not found.")
+    new_role = req.role.strip().lower()
+    if new_role not in ("guest", "collaborator"):
+        raise HTTPException(status_code=400, detail="Role must be guest or collaborator.")
+    old_role = target.get("role", "guest")
+    if old_role == new_role:
+        return {"status": "unchanged", "member_id": req.member_id, "role": new_role}
+    target["role"] = new_role
+    target["role_changed_at"] = now_iso()
+    target["role_changed_by"] = member_display(user_data["info"])
+    record_event(
+        "role_changed",
+        member_display(user_data["info"]),
+        member_display(target),
+        {"member_id": req.member_id, "from": old_role, "to": new_role}
+    )
+    persist_server_state()
+    return {"status": "role_changed", "member_id": req.member_id, "name": member_display(target), "role": new_role}
+
+
+@app.post("/team/login")
+def team_login(req: TeamLoginRequest):
+    token = req.token.strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="Login credential is required.")
+    user_data = auth_from_token(token)
+    info = user_data["info"]
+    return {
+        "status": "ok",
+        "role": info.get("role", "guest"),
+        "name": member_display(info),
+        "handle": info.get("handle", ""),
+        "member_id": user_data["member_id"]
     }
 
 
@@ -660,6 +751,7 @@ def leave_team(user_data: dict = Depends(get_user)):
     USER_SESSIONS.pop(token, None)
 
     record_event("left", name)
+    persist_server_state()
 
     return {"status": "left", "name": name}
 
@@ -695,7 +787,15 @@ def get_team_state(user_data: dict = Depends(get_user)):
         "admin": HOST_NAME,
         "session_id": CURRENT_SESSION_ID,
         "events": TEAM_EVENTS[-100:],
-        "live_history": history_view_for(user_data["member_id"], snapshot_history())
+        "live_history": history_view_for(user_data["member_id"], snapshot_history()),
+        # Consolidated control-plane data: the GUI can refresh most team UI with
+        # one request instead of a cascade of polling requests.
+        "users": [m for m in public_member_list() if m["member_id"] == "host" or m["online"]],
+        "conversations": get_chat_conversations.__wrapped__(user_data) if False else get_chat_conversations(user_data),
+        "history_sessions": [
+            {"session_id": sid, "started_at": meta.get("started_at", ""), "live": sid == CURRENT_SESSION_ID}
+            for sid, meta in SESSION_RECORDS.items()
+        ]
     }
 
 
@@ -785,8 +885,7 @@ def sync_brain(payload: SyncPayload, user_data: dict = Depends(require_host)):
 
         BRAIN_VERSION += 1
         TEAM_BRAIN_READY = True
-        USER_SESSIONS.clear()
-        CHAT_AI_SESSIONS.clear()
+        # Brain updates do not reset the current AI/chat session.
 
         record_event(
             "brain_synced",
@@ -866,23 +965,95 @@ def _set_brain_workspace_context():
     }
 
 
+def _isolated_ai_target(conn, payload):
+    try:
+        from backend import run_isolated_ai_query
+        result = run_isolated_ai_query(payload)
+        conn.send((True, result))
+    except Exception as exc:
+        conn.send((False, str(exc)))
+    finally:
+        conn.close()
+
+
+def _run_team_ai_query(query_text, token):
+    global AI_ACTIVE
+    # One Team AI inference at a time keeps the isolated Ollama runner stable.
+    with AI_QUERY_LOCK:
+        return _run_team_ai_query_locked(query_text, token)
+
+def _run_team_ai_query_locked(query_text, token):
+    global AI_ACTIVE
+    with AI_ACTIVE_LOCK:
+        AI_ACTIVE += 1
+    parent_conn, child_conn = mp.Pipe(duplex=False)
+    try:
+        _set_brain_workspace_context()
+        with STATE_LOCK:
+            history = list(USER_SESSIONS.setdefault(token, []))
+        with BRAIN_LOCK:
+            payload = {
+                "query": query_text,
+                "chunks": list(brain.chunks),
+                "sources": list(brain.sources),
+                "embeddings": np.asarray(brain.embeddings, dtype=np.float32).copy(),
+                "source_order": list(getattr(brain, "source_order", []) or []),
+                "history": history,
+                "model": getattr(brain, "model", "llama3.1"),
+                "embedding_model": getattr(brain, "embedding_model", "nomic-embed-text"),
+                "team_mode": getattr(brain, "team_mode", TEAM_MODE),
+                "workspace_context": dict(getattr(brain, "workspace_context", {}) or {}),
+            }
+
+        ctx = mp.get_context("spawn") if os.name == "nt" else mp.get_context("fork")
+        proc = ctx.Process(target=_isolated_ai_target, args=(child_conn, payload), daemon=True)
+        proc.start()
+        child_conn.close()
+        if not parent_conn.poll(120):
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(5)
+            return "⚠️ AI inference timed out safely. Team services remain available; please try again.", []
+        ok, result = parent_conn.recv()
+        proc.join(5)
+        if ok:
+            ans, srcs = result
+            with STATE_LOCK:
+                session = USER_SESSIONS.setdefault(token, [])
+                session.extend([
+                    {"role": "user", "content": query_text},
+                    {"role": "assistant", "content": ans},
+                ])
+                del session[:-8]
+            return ans, srcs
+        return f"⚠️ AI worker failed safely: {result}", []
+    finally:
+        try: parent_conn.close()
+        except Exception: pass
+        try: child_conn.close()
+        except Exception: pass
+        with AI_ACTIVE_LOCK:
+            AI_ACTIVE = max(0, AI_ACTIVE - 1)
+
+
 @app.post("/query")
-def query_brain(q: Query, user_data: dict = Depends(get_user)):
+async def query_brain(q: Query, user_data: dict = Depends(get_user)):
     token = user_data["token"]
     name = member_display(user_data["info"])
 
-    if not TEAM_BRAIN_READY or len(brain.chunks) == 0:
+    with BRAIN_LOCK:
+        brain_ready = bool(TEAM_BRAIN_READY and len(brain.chunks) > 0)
+    if not brain_ready:
         return {
             "answer": "⚠️ Team Brain is empty. Ask the Host to load code.",
             "sources": []
         }
 
-    if token not in USER_SESSIONS:
-        USER_SESSIONS[token] = []
-
-    with BRAIN_LOCK:
-        _set_brain_workspace_context()
-        ans, srcs = brain.ask_question(q.text, history=USER_SESSIONS[token])
+    # The AI worker is an independently killable process. FastAPI itself only
+    # coordinates the request and therefore remains responsive even if Ollama
+    # or a model runner becomes stuck.
+    loop = asyncio.get_running_loop()
+    ans, srcs = await loop.run_in_executor(None, _run_team_ai_query, q.text, token)
 
     if q.public:
         TEAM_HISTORY.append({
@@ -932,6 +1103,7 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
         f"Server Mode: {TEAM_MODE}"
     )
 
+    INGEST_LOCK.acquire()
     try:
         # The client-provided source path is metadata only. The server creates a
         # stable per-member logical identity, so `main.py` from two contributors
@@ -990,8 +1162,7 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
 
         BRAIN_VERSION += 1
         TEAM_BRAIN_READY = True
-        USER_SESSIONS.clear()
-        CHAT_AI_SESSIONS.clear()
+        # Brain updates do not reset the current AI/chat session.
 
         record_event(
             "brain_updated",
@@ -1021,6 +1192,8 @@ def ingest_remote(req: IngestRequest, user_data: dict = Depends(get_user)):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        INGEST_LOCK.release()
 
 
 # ============================================================
@@ -1739,7 +1912,7 @@ if __name__ == "__main__":
     initialize_server()
     print("\n" + "=" * 55)
     print("       🚀 CODECHAT TEAM SERVER")
-    print("       VERSION 35.0")
+    print("       VERSION 42.0")
     print("=" * 55 + "\n")
 
     print("🧹 Fresh AI session: no previous Brain or AI conversation was restored.")
