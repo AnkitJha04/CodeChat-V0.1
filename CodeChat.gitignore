@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / builds
+build/
+dist/
+*.spec
+
+# PyInstaller
+*.manifest
+*.toc
+*.pyz
+*.pyzw
+*.lnk
+
+# CodeChat runtime data
+sessions/
+teams.json
+*.brain
+*.ccsession
+
+# Local configuration / secrets
+.env
+.env.*
+*.secret
+secrets/
+credentials/
+tokens/
+
+# Logs
+*.log
+logs/
+
+# IDE / editors
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# Test / local data
+test_data/
+test_files/
+uploads/
+downloads/
+
+# Ollama / generated local data
+ollama/

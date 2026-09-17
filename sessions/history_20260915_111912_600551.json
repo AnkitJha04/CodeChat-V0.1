@@ -2,8 +2,8 @@
   "session_id": "history_20260915_111912_600551",
   "started_at": "2026-09-15T11:19:12",
   "created_by": "Host",
-  "updated_at": "2026-09-15T11:27:48",
-  "live": true,
+  "updated_at": "2026-09-15T21:09:22",
+  "live": false,
   "participants": [
     "host"
   ],
@@ -242,9 +242,9 @@
       "handle": "ankit",
       "role": "collaborator",
       "status": "active",
-      "online": true
+      "online": false
     }
   ],
   "mode": "single",
-  "brain_version": 2
+  "brain_version": 0
 }
